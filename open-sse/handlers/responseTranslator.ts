@@ -546,6 +546,15 @@ export function translateNonStreamingResponse(
           completion_tokens: completionTokens,
           total_tokens: promptTokens + completionTokens,
         };
+        // Non-streaming Claude→OpenAI translation: preserve cache fields
+        const cacheRead = toNumber(usage.cache_read_input_tokens, 0);
+        const cacheCreation = toNumber(usage.cache_creation_input_tokens, 0);
+        if (cacheRead > 0 || cacheCreation > 0) {
+          const details: Record<string, unknown> = {};
+          if (cacheRead > 0) details.cached_tokens = cacheRead;
+          if (cacheCreation > 0) details.cache_creation_tokens = cacheCreation;
+          (result.usage as Record<string, unknown>).prompt_tokens_details = details;
+        }
       }
 
       intermediateOpenAI = result;

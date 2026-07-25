@@ -237,6 +237,8 @@ export function filterUsageForFormat(usage, targetFormat) {
       "completion_tokens_details",
       "prompt_cache_hit_tokens",
       "prompt_cache_miss_tokens",
+      "cache_read_input_tokens",
+      "cache_creation_input_tokens",
       "estimated",
     ],
   };
@@ -401,13 +403,16 @@ export function extractUsage(chunk) {
         chunk.usage.prompt_tokens_details?.cached_tokens ??
         chunk.usage.input_tokens_details?.cached_tokens ??
         chunk.usage.prompt_cache_hit_tokens ??
-        chunk.usage.cached_tokens,
+        chunk.usage.cached_tokens ??
+        chunk.usage.cache_read_input_tokens,
       reasoning_tokens:
         chunk.usage.completion_tokens_details?.reasoning_tokens ??
         chunk.usage.output_tokens_details?.reasoning_tokens ??
         chunk.usage.reasoning_tokens,
       // xAI's exact provider-reported cost (port of decolua/9router#2453, capability A).
       cost_in_usd_ticks: chunk.usage.cost_in_usd_ticks,
+      cache_read_input_tokens: chunk.usage.cache_read_input_tokens,
+      cache_creation_input_tokens: chunk.usage.cache_creation_input_tokens,
     });
   }
 

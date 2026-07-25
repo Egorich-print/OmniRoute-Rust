@@ -31,6 +31,8 @@ const ALLOWED_USAGE_FIELDS = new Set([
   "cached_tokens",
   "prompt_tokens_details",
   "completion_tokens_details",
+  "cache_read_input_tokens",
+  "cache_creation_input_tokens",
   // Keep through sanitize → applyClientUsageBuffer so heuristic web usage is
   // not inflated by the default USAGE_TOKEN_BUFFER (2000).
   "estimated",
@@ -496,6 +498,18 @@ function sanitizeUsage(usage: unknown): unknown {
     sanitized.prompt_tokens_details = details;
   }
 
+  // MiniMax / Bedrock etc.: flat cache_read_input_tokens → nested prompt_tokens_details
+  if (
+    sanitized.cache_read_input_tokens !== undefined &&
+    sanitized.cache_read_input_tokens !== 0 &&
+    (!sanitized.prompt_tokens_details ||
+      !(sanitized.prompt_tokens_details as Record<string, unknown>).cached_tokens)
+  ) {
+    const details = (sanitized.prompt_tokens_details as Record<string, unknown>) ?? {};
+    details.cached_tokens = sanitized.cache_read_input_tokens;
+    sanitized.prompt_tokens_details = details;
+  }
+
   // Ensure required fields
   const promptTokens = toNumber(sanitized.prompt_tokens) ?? 0;
   const completionTokens = toNumber(sanitized.completion_tokens) ?? 0;
@@ -541,6 +555,18 @@ function sanitizeResponsesUsage(usage: unknown): unknown {
     normalized.input_tokens_details = {
       ...(normalized.input_tokens_details as Record<string, unknown> || {}),
       cached_tokens: normalized.prompt_cache_hit_tokens,
+    };
+  }
+
+  // MiniMax / Bedrock: flat cache_read_input_tokens → input_tokens_details.cached_tokens
+  if (
+    normalized.cache_read_input_tokens !== undefined &&
+    normalized.cache_read_input_tokens !== 0 &&
+    !normalized.input_tokens_details?.cached_tokens
+  ) {
+    normalized.input_tokens_details = {
+      ...(normalized.input_tokens_details as Record<string, unknown> || {}),
+      cached_tokens: normalized.cache_read_input_tokens,
     };
   }
 
