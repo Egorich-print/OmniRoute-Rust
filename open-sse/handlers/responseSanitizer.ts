@@ -483,6 +483,19 @@ function sanitizeUsage(usage: unknown): unknown {
     }
   }
 
+  // DeepSeek native API uses flat prompt_cache_hit_tokens (NOT
+  // prompt_tokens_details.cached_tokens). Map it into prompt_tokens_details
+  // so clients see the real cache hit count (#8171).
+  if (
+    usageRecord.prompt_cache_hit_tokens !== undefined &&
+    (!sanitized.prompt_tokens_details ||
+      !(sanitized.prompt_tokens_details as Record<string, unknown>).cached_tokens)
+  ) {
+    const details = (sanitized.prompt_tokens_details as Record<string, unknown>) ?? {};
+    details.cached_tokens = usageRecord.prompt_cache_hit_tokens;
+    sanitized.prompt_tokens_details = details;
+  }
+
   // Ensure required fields
   const promptTokens = toNumber(sanitized.prompt_tokens) ?? 0;
   const completionTokens = toNumber(sanitized.completion_tokens) ?? 0;
@@ -518,6 +531,17 @@ function sanitizeResponsesUsage(usage: unknown): unknown {
     normalized.output_tokens_details === undefined
   ) {
     normalized.output_tokens_details = normalized.completion_tokens_details;
+  }
+
+  // DeepSeek native API: map flat prompt_cache_hit_tokens into input_tokens_details
+  if (
+    normalized.prompt_cache_hit_tokens !== undefined &&
+    !normalized.input_tokens_details?.cached_tokens
+  ) {
+    normalized.input_tokens_details = {
+      ...(normalized.input_tokens_details as Record<string, unknown> || {}),
+      cached_tokens: normalized.prompt_cache_hit_tokens,
+    };
   }
 
   const inputDetails = toRecord(normalized.input_tokens_details) || {};
