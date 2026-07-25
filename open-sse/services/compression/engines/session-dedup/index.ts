@@ -110,6 +110,47 @@ function findSuffixBlocks(
 // ─── two-pass dedup on message texts ─────────────────────────────────────────
 
 /**
+ * Replace every occurrence of `needle` in `haystack` after the first with
+ * `marker`, keeping the first occurrence intact. Returns the new string and
+ * how many replacements were made.
+ *
+ * Uses plain `indexOf`/slice instead of a dynamically-built global RegExp:
+ * escaping an up-to-multi-hundred-KB literal block into a RegExp and running
+ * it (once per candidate block, once for counting + once for replacing) is
+ * pathologically slow on large single-message inputs — the exact
+ * multi-thousand-line "huge tool result" shape the O(n²) guard above targets
+ * (#OOM incident) — so a single call could still take tens of seconds even
+ * though findSuffixBlocks itself is bounded. indexOf-based scanning is O(n)
+ * per pass and has no compile step.
+ */
+function replaceAllButFirst(
+  haystack: string,
+  needle: string,
+  marker: string
+): { result: string; occurrences: number } {
+  if (needle.length === 0) return { result: haystack, occurrences: 0 };
+
+  const firstIdx = haystack.indexOf(needle);
+  if (firstIdx === -1) return { result: haystack, occurrences: 0 };
+
+  let occurrences = 1;
+  let searchFrom = firstIdx + needle.length;
+  let result = haystack.slice(0, searchFrom);
+  let cursor = searchFrom;
+
+  for (;;) {
+    const idx = haystack.indexOf(needle, cursor);
+    if (idx === -1) break;
+    occurrences++;
+    result += haystack.slice(cursor, idx) + marker;
+    cursor = idx + needle.length;
+  }
+  result += haystack.slice(cursor);
+
+  return { result, occurrences };
+}
+
+/**
  * Deduplicates repeated lines within a single message (intra-message dedup).
  * Replaces repeated suffix blocks with markers.
  */
@@ -122,34 +163,22 @@ function dedupeWithinMessage(
 
   if (blocks.length < 2) return { deduped: text, changed: false };
 
-  // Find the most common block (likely candidate for intra-message dedup).
-  const blockFreq = new Map<string, number>();
-  for (const { block } of blocks) {
-    blockFreq.set(block, (blockFreq.get(block) || 0) + 1);
-  }
-
-  // Sort by frequency descending, then by length descending (prefer replacing more common, longer blocks first).
-  const sortedBlocks = [...blocks].sort((a, b) => {
-    const freqDiff = (blockFreq.get(b.block) || 0) - (blockFreq.get(a.block) || 0);
-    return freqDiff !== 0 ? freqDiff : b.block.length - a.block.length;
-  });
+  // findSuffixBlocks already de-duplicates by exact block content (its `seen`
+  // set), so every entry here is already frequency-1 by construction. Sort by
+  // length descending so the longest candidate blocks are tried first.
+  const sortedBlocks = [...blocks].sort((a, b) => b.block.length - a.block.length);
 
   let result = text;
   let changed = false;
 
   for (const { block } of sortedBlocks) {
-    // Only dedup blocks that appear 2+ times in the text.
-    const occurrences = (result.match(new RegExp(block.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []).length;
-    if (occurrences < 2) continue;
-
     const sha = hashBlock(block);
     const marker = `[dedup:ref sha=${sha}]`;
-    // Replace ALL occurrences except the first (keep the original once).
-    let count = 0;
-    result = result.replace(new RegExp(block.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), () => {
-      count++;
-      return count === 1 ? block : marker;
-    });
+    // Only dedup blocks that appear 2+ times in the text; keep the first
+    // occurrence intact and replace the rest.
+    const { result: replaced, occurrences } = replaceAllButFirst(result, block, marker);
+    if (occurrences < 2) continue;
+    result = replaced;
     changed = true;
   }
 
