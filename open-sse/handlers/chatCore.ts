@@ -114,7 +114,10 @@ import {
   isOpencodeGoProvider,
   stripBooleanReasoning,
 } from "../services/opencodeReasoningSanitizer.ts";
-import { normalizeClaudeAdaptiveThinking } from "../services/claudeAdaptiveThinking.ts";
+import {
+  normalizeClaudeAdaptiveThinking,
+  normalizeClaudeDisabledThinkingEffort,
+} from "../services/claudeAdaptiveThinking.ts";
 import { normalizeClaudeHaikuConstraints } from "../services/claudeHaikuConstraints.ts";
 import { applyDefaultReasoningEffort } from "../services/defaultReasoningEffort.ts";
 import { echoModelInObject } from "../services/responseModelEcho.ts";
@@ -857,13 +860,17 @@ export async function handleChatCore({
       pendingWrite: compressionAnalyticsWritePromise,
       skillRequestId,
     });
-  const pipelineSessionId =
+  // #8249: raw header value, kept separate from `pipelineSessionId`'s skillRequestId fallback
+  // below so call_logs.session_tag is only ever set when the caller explicitly supplied the
+  // header — never synthesized from the internal per-request skillRequestId.
+  const explicitSessionIdHeader =
     (clientRawRequest?.headers && typeof clientRawRequest.headers.get === "function"
       ? clientRawRequest.headers.get("x-omniroute-session-id")
       : getHeaderValueCaseInsensitive(
           clientRawRequest?.headers ?? null,
           "x-omniroute-session-id"
-        )) || skillRequestId;
+        )) || null;
+  const pipelineSessionId = explicitSessionIdHeader || skillRequestId;
   // persistAttemptLogs extracted to chatCore/attemptLogging.ts (#3501); bind the per-request context
   // once so the 16 call sites keep passing only the per-attempt args (byte-identical).
   const persistAttemptLogs = (args: PersistAttemptLogsArgs) =>
@@ -891,6 +898,7 @@ export async function handleChatCore({
       noLogEnabled,
       correlationId,
       modelPinned,
+      sessionTag: explicitSessionIdHeader,
     });
 
   // Primary path: merge client model id + alias target so config on either key applies; resolved
@@ -2244,6 +2252,14 @@ export async function handleChatCore({
     // defaults) to `{type:"adaptive"}` — effort stays on `output_config.effort`. Keyed on
     // the resolved upstream model, so it covers every routing mode. See claudeAdaptiveThinking.ts.
     translatedBody = normalizeClaudeAdaptiveThinking(translatedBody, finalModelToUpstream);
+    // Opus 5 allows disabled thinking only through high effort on Anthropic's direct
+    // Messages API. The helper scopes this constraint to `anthropic` and `claude`;
+    // GitHub Copilot and Claude Web use separate upstream contracts.
+    translatedBody = normalizeClaudeDisabledThinkingEffort(
+      translatedBody,
+      finalModelToUpstream,
+      provider
+    );
     // Claude Haiku rejects `thinking.type:"adaptive"` and `output_config.effort`
     // (both Sonnet 4.6 / Opus 4.5+ only). Several paths can still emit those
     // shapes on a Haiku target — native passthrough, reasoning_effort buckets,
@@ -2989,11 +3005,7 @@ export async function handleChatCore({
           rawResult._executionCredentials?.connectionId &&
           rawResult._executionCredentials?.apiKey
         ) {
-          recordKeyHealthStatus(
-            status,
-            rawResult._executionCredentials,
-            rawResult.transport
-          );
+          recordKeyHealthStatus(status, rawResult._executionCredentials, rawResult.transport);
         }
         releaseRawResultAccountSemaphore =
           typeof rawResult._accountSemaphoreRelease === "function"
@@ -3214,17 +3226,29 @@ export async function handleChatCore({
     // via isLocalStreamLifecycleError so those map to 499 instead of falling
     // through to the 502 provider-failure default.
     const isRequestAborted = isLocalStreamLifecycleError(error);
+    // #8376: an unreachable upstream proxy (ECONNREFUSED/ECONNRESET/...) is tagged by
+    // proxyFetch.ts (tagProxyUnreachable) with `.errorCode = "proxy_unreachable"` before
+    // it reaches this catch. Classify it explicitly to 502 instead of falling through
+    // the generic `error.status` branch (a raw connect-refused error has no `.status` at
+    // all, so it used to collapse into an ordinary 502/504 the provider-breaker predicate
+    // can't tell apart from a per-model 5xx).
+    const isProxyUnreachableFailure =
+      !isRequestAborted && (error as { errorCode?: unknown })?.errorCode === "proxy_unreachable";
     const failureStatus = isRequestAborted
       ? 499
-      : error.name === "TimeoutError" || error.name === "BodyTimeoutError"
-        ? HTTP_STATUS.GATEWAY_TIMEOUT
-        : error.status && typeof error.status === "number"
-          ? error.status
-          : HTTP_STATUS.BAD_GATEWAY;
+      : isProxyUnreachableFailure
+        ? HTTP_STATUS.BAD_GATEWAY
+        : error.name === "TimeoutError" || error.name === "BodyTimeoutError"
+          ? HTTP_STATUS.GATEWAY_TIMEOUT
+          : error.status && typeof error.status === "number"
+            ? error.status
+            : HTTP_STATUS.BAD_GATEWAY;
     const failureMessage = isRequestAborted
       ? "Request aborted"
       : formatProviderError(error, provider, model, failureStatus);
-    const upstreamErrorCode = getUpstreamErrorIdentifier(error);
+    const upstreamErrorCode = isProxyUnreachableFailure
+      ? "proxy_unreachable"
+      : getUpstreamErrorIdentifier(error);
     // Tag our own deadline timeouts (fetch-start TimeoutError / body BodyTimeoutError,
     // both surfaced as a 504) as "upstream_timeout" so the cooldown layer can tell a
     // slow-but-not-failed request apart from a real provider 5xx. (Antigravity already
@@ -4238,7 +4262,12 @@ export async function handleChatCore({
       });
     }
 
-    applyClientUsageBuffer(translatedResponse, body, clientResponseFormat);
+    // #8331: keep the client-visible metering fields real everywhere except Claude-Code-compatible
+    // providers, where Claude Code's own context accounting relies on the buffered number — see
+    // clientUsageBuffer.ts module docstring.
+    applyClientUsageBuffer(translatedResponse, body, clientResponseFormat, {
+      preserveContextBudgetInVisibleUsage: isClaudeCodeCompatible,
+    });
 
     if (memoryOwnerId && memorySettings?.enabled && memorySettings.maxTokens > 0) {
       const requestMemoryText = extractMemoryTextFromRequestBody(body as Record<string, unknown>);
@@ -4472,6 +4501,13 @@ export async function handleChatCore({
     if (typeof model === "string" && model) echoModelInObject(translatedResponse, model);
     // #1311: echo the requested alias/combo name in the non-streaming response model.
     if (echoModel) echoModelInObject(translatedResponse, echoModel);
+
+    // ── Plugin onResponse hook (fire-and-forget) ──
+    // #8395: the streaming branch below already calls this; the non-streaming
+    // (stream:false) branch returned without it, so onResponse never fired for
+    // non-streaming requests at all.
+    await runPluginOnResponseHook({ requestId: traceId, body, model, provider, apiKeyInfo });
+
     return {
       success: true,
       response: buildNonStreamingJsonResponse(translatedResponse, responseHeaders),

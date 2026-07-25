@@ -889,7 +889,7 @@ test("handleComboChat records per-target metrics separately when the same model 
   assert.equal(metrics.byTarget[secondStep.id].connectionId, "conn-openai-b");
 });
 
-test("handleComboChat preserves the first failure status but surfaces the last error message plus per-model diagnostics", async () => {
+test("handleComboChat surfaces the last failing target's status AND error message together, not a cross-target mismatch (#8486)", async () => {
   const result = await handleComboChat({
     body: {},
     combo: {
@@ -910,7 +910,7 @@ test("handleComboChat preserves the first failure status but surfaces the last e
 
   const payload = (await result.json()) as any;
 
-  assert.equal(result.status, 500);
+  assert.equal(result.status, 429); // #8486: status/message from the SAME (last) failing target
   // The last error message is preserved and now carries an aggregated
   // per-model diagnostics suffix (status codes for every target attempted
   // in this set try), added alongside the global comboTimeoutMs feature.
@@ -1671,7 +1671,7 @@ test("handleComboChat round-robin falls through generic 400s when a later model 
   assert.deepEqual(calls, ["model-a", "model-b"]);
 });
 
-test("handleComboChat round-robin falls through 400s and returns the final error payload when no target recovers", async () => {
+test("handleComboChat round-robin falls through 400s and returns the LAST target's status+message together, not a cross-target mismatch (#8486)", async () => {
   const calls: any[] = [];
 
   const result = await handleComboChat({
@@ -1709,7 +1709,7 @@ test("handleComboChat round-robin falls through 400s and returns the final error
   });
 
   const payload = (await result.json()) as any;
-  assert.equal(result.status, 400);
+  assert.equal(result.status, 500); // #8486: status/message from the SAME (last) failing target
   assert.equal(payload.error.message, "rr-final-fail");
   assert.deepEqual(calls, ["model-a", "model-b"]);
 });

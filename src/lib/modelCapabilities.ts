@@ -281,9 +281,21 @@ function reverseModelsDevProviders(provider: string): string[] {
   // models.dev may store capabilities under a different OmniRoute provider id
   // that also maps from the same upstream models.dev provider. Build reverse
   // candidates from MODELS_DEV_PROVIDER_MAP (e.g. openai ↔ cx).
+  //
+  // MODELS_DEV_PROVIDER_MAP's RHS is inconsistent: most providers list their
+  // canonical id directly, but the OAuth CLI providers (codex/claude) only
+  // list their alias (cx/cc), never the canonical id. Also probe the
+  // provider's alias so a canonical id like "codex"/"claude" still matches
+  // the map entries keyed only by "cx"/"cc" (#8429).
   const out = new Set<string>();
+  const providerAlias = PROVIDER_ID_TO_ALIAS[provider] || provider;
   for (const [modelsDevId, omniIds] of Object.entries(MODELS_DEV_PROVIDER_MAP)) {
-    if (omniIds.includes(provider) || modelsDevId === provider) {
+    if (
+      omniIds.includes(provider) ||
+      omniIds.includes(providerAlias) ||
+      modelsDevId === provider ||
+      modelsDevId === providerAlias
+    ) {
       out.add(modelsDevId);
       for (const id of omniIds) out.add(id);
     }
