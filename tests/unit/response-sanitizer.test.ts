@@ -1060,3 +1060,80 @@ test("sanitizer leaves normal tool arguments byte-identical (no parse/restringif
   };
   assert.equal(nonStream.choices[0].message.tool_calls[0].function.arguments === rawArgs, true);
 });
+
+// ── Regression: non-standard cache token passthrough (#8591 / Ref #8171) ──
+// DeepSeek native API returns flat `prompt_cache_hit_tokens`; MiniMax / OpenAI-compatible
+// returns flat `cache_read_input_tokens`; Bedrock returns `cacheReadInputTokenCount`.
+// None of them use the standard `prompt_tokens_details.cached_tokens` shape, so without
+// the explicit mapping in `sanitizeUsage`, agents (Cline / Cursor / Claude Code) see
+// `cached_tokens: 0` and lose visibility into cache hit efficiency.
+
+test("sanitizeOpenAIResponse maps flat prompt_cache_hit_tokens into prompt_tokens_details.cached_tokens (DeepSeek)", () => {
+  const out = sanitizeOpenAIResponse({
+    id: "chatcmpl_deepseek",
+    model: "deepseek-chat",
+    choices: [
+      {
+        index: 0,
+        finish_reason: "stop",
+        message: { role: "assistant", content: "ok" },
+      },
+    ],
+    usage: {
+      prompt_tokens: 100,
+      completion_tokens: 50,
+      prompt_cache_hit_tokens: 30,
+    },
+  }) as { usage: { prompt_tokens_details?: { cached_tokens?: number } } };
+
+  assert.equal(out.usage.prompt_tokens_details?.cached_tokens, 30);
+});
+
+test("sanitizeOpenAIResponse maps flat cache_read_input_tokens into prompt_tokens_details.cached_tokens (MiniMax / OpenAI-compatible)", () => {
+  const out = sanitizeOpenAIResponse({
+    id: "chatcmpl_minimax",
+    model: "MiniMax-Text-01",
+    choices: [
+      {
+        index: 0,
+        finish_reason: "stop",
+        message: { role: "assistant", content: "ok" },
+      },
+    ],
+    usage: {
+      prompt_tokens: 200,
+      completion_tokens: 80,
+      cache_read_input_tokens: 64,
+      cache_creation_input_tokens: 10,
+    },
+  }) as { usage: { prompt_tokens_details?: { cached_tokens?: number } } };
+
+  assert.equal(out.usage.prompt_tokens_details?.cached_tokens, 64);
+});
+
+test("sanitizeResponsesApiResponse maps flat prompt_cache_hit_tokens into input_tokens_details.cached_tokens (DeepSeek)", () => {
+  const out = sanitizeResponsesApiResponse({
+    id: "resp_deepseek",
+    usage: {
+      input_tokens: 100,
+      output_tokens: 50,
+      prompt_cache_hit_tokens: 30,
+    },
+  }) as { usage: { input_tokens_details?: { cached_tokens?: number } } };
+
+  assert.equal(out.usage.input_tokens_details?.cached_tokens, 30);
+});
+
+test("sanitizeResponsesApiResponse maps flat cache_read_input_tokens into input_tokens_details.cached_tokens (MiniMax via Responses)", () => {
+  const out = sanitizeResponsesApiResponse({
+    id: "resp_minimax",
+    usage: {
+      input_tokens: 200,
+      output_tokens: 80,
+      cache_read_input_tokens: 64,
+      cache_creation_input_tokens: 10,
+    },
+  }) as { usage: { input_tokens_details?: { cached_tokens?: number } } };
+
+  assert.equal(out.usage.input_tokens_details?.cached_tokens, 64);
+});

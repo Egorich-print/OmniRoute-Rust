@@ -550,7 +550,7 @@ function sanitizeResponsesUsage(usage: unknown): unknown {
   // DeepSeek native API: map flat prompt_cache_hit_tokens into input_tokens_details
   if (
     normalized.prompt_cache_hit_tokens !== undefined &&
-    !normalized.input_tokens_details?.cached_tokens
+    !(normalized.input_tokens_details as Record<string, unknown> | undefined)?.cached_tokens
   ) {
     normalized.input_tokens_details = {
       ...(normalized.input_tokens_details as Record<string, unknown> || {}),
@@ -562,7 +562,7 @@ function sanitizeResponsesUsage(usage: unknown): unknown {
   if (
     normalized.cache_read_input_tokens !== undefined &&
     normalized.cache_read_input_tokens !== 0 &&
-    !normalized.input_tokens_details?.cached_tokens
+    !(normalized.input_tokens_details as Record<string, unknown> | undefined)?.cached_tokens
   ) {
     normalized.input_tokens_details = {
       ...(normalized.input_tokens_details as Record<string, unknown> || {}),
