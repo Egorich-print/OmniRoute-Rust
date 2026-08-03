@@ -3,6 +3,22 @@
  * Pure data; merged by apikey/index.ts via spread (god-file decomposition; semantic split).
  */
 export const APIKEY_PROVIDERS_GATEWAYS = {
+  // Cheaper Inference (https://cheaperinference.com) — OSS-sponsor gateway.
+  // Cost-ranked reseller of 42 upstream models (Anthropic/OpenAI/Google/Moonshot/
+  // xAI/Z.AI/DeepSeek/MiniMax) behind one OpenAI-compatible surface, with a native
+  // /v1/responses endpoint and 3 image models. Keys are `ir_live_…` bearer tokens.
+  cheaperinference: {
+    id: "cheaperinference",
+    alias: "cinf",
+    name: "Cheaper Inference",
+    icon: "savings",
+    color: "#31f889",
+    textIcon: "CI",
+    website: "https://cheaperinference.com/?utm_source=omniroute",
+    apiHint:
+      "Create an API key at https://cheaperinference.com/?utm_source=omniroute (needs the `inference` scope), then paste the ir_live_… token here.",
+    passthroughModels: true,
+  },
   "charm-hyper": {
     id: "charm-hyper",
     alias: "charm-hyper",
@@ -279,8 +295,7 @@ export const APIKEY_PROVIDERS_GATEWAYS = {
     textIcon: "G4F",
     website: "https://g4f.space",
     hasFree: true,
-    freeNote:
-      "Free no-key reverse proxy to Groq (gpt4free project) — rate-limited to 5 req/min.",
+    freeNote: "Free no-key reverse proxy to Groq (gpt4free project) — rate-limited to 5 req/min.",
     passthroughModels: true,
     authHint:
       "No auth required. Free tier is limited to 5 requests/minute — sign up at g4f.dev/members.html for higher limits.",
@@ -294,8 +309,7 @@ export const APIKEY_PROVIDERS_GATEWAYS = {
     textIcon: "G4F",
     website: "https://g4f.space",
     hasFree: true,
-    freeNote:
-      "Free no-key reverse proxy to Gemini (gpt4free project) — rate-limited to 5 req/min.",
+    freeNote: "Free no-key reverse proxy to Gemini (gpt4free project) — rate-limited to 5 req/min.",
     passthroughModels: true,
     authHint:
       "No auth required. Free tier is limited to 5 requests/minute — sign up at g4f.dev/members.html for higher limits.",
@@ -324,8 +338,7 @@ export const APIKEY_PROVIDERS_GATEWAYS = {
     textIcon: "G4F",
     website: "https://g4f.space",
     hasFree: true,
-    freeNote:
-      "Free no-key hosted Ollama gateway (gpt4free project) — rate-limited to 5 req/min.",
+    freeNote: "Free no-key hosted Ollama gateway (gpt4free project) — rate-limited to 5 req/min.",
     passthroughModels: true,
     authHint:
       "No auth required. Free tier is limited to 5 requests/minute — sign up at g4f.dev/members.html for higher limits.",
@@ -743,7 +756,8 @@ export const APIKEY_PROVIDERS_GATEWAYS = {
     website: "https://ainative.studio",
     hasFree: true,
     freeNote: "Free tier ~10M tokens/month (claimed) across Qwen3, Llama 4, DeepSeek R1 and more.",
-    authHint: "Create a free API key at ainative.studio (no card), then paste it here as a Bearer token.",
+    authHint:
+      "Create a free API key at ainative.studio (no card), then paste it here as a Bearer token.",
     apiHint:
       "OpenAI-compatible endpoint at https://api.ainative.studio/api/v1 with a public /models catalog (84 models). OmniRoute lists models via passthrough.",
   },
@@ -758,7 +772,8 @@ export const APIKEY_PROVIDERS_GATEWAYS = {
     website: "https://www.aionlabs.ai",
     hasFree: true,
     freeNote: "Free tier ~20k tokens/day across the Aion reasoning models.",
-    authHint: "Create a free API key at aionlabs.ai (no card), then paste it here as a Bearer token.",
+    authHint:
+      "Create a free API key at aionlabs.ai (no card), then paste it here as a Bearer token.",
     apiHint:
       "OpenAI-compatible endpoint at https://api.aionlabs.ai/v1 with a public /models catalog carrying context and pricing.",
   },
@@ -772,7 +787,8 @@ export const APIKEY_PROVIDERS_GATEWAYS = {
     passthroughModels: true,
     website: "https://routeway.ai",
     hasFree: true,
-    freeNote: "Free models (:free suffix) at ~5 RPM / 200 RPD across Llama, Nemotron, Step and Laguna.",
+    freeNote:
+      "Free models (:free suffix) at ~5 RPM / 200 RPD across Llama, Nemotron, Step and Laguna.",
     authHint: "Create a free API key at routeway.ai, then paste it here as a Bearer token.",
     apiHint:
       "OpenAI-compatible endpoint at https://api.routeway.ai/v1 with a public /models catalog (236 models). Cloudflare fronts the API and requires a browser-style User-Agent.",
@@ -788,7 +804,8 @@ export const APIKEY_PROVIDERS_GATEWAYS = {
     website: "https://bynara.id",
     hasFree: true,
     freeNote: "Free tier is a shared 5M tokens/day pool; some models are gated behind credit/plan.",
-    authHint: "Get a free API key via NaraRouter's Telegram channel, then paste it here as a Bearer token.",
+    authHint:
+      "Get a free API key via NaraRouter's Telegram channel, then paste it here as a Bearer token.",
     apiHint:
       "OpenAI-compatible endpoint at https://router.bynara.id/v1. Free-tier models are pinned; others need credit.",
   },

@@ -193,7 +193,8 @@ test("injectMemoryAndSkills does not inject server memory tools for stream reque
   });
 
   assert.equal(result.memorySettings?.enabled, true);
-  const tools = (result.body.tools as { function?: { name?: string }; name?: string }[] | undefined) ?? [];
+  const tools =
+    (result.body.tools as { function?: { name?: string }; name?: string }[] | undefined) ?? [];
   const toolNames = tools.map((tool) => tool.function?.name ?? tool.name);
   for (const memoryTool of MEMORY_BUILTIN_TOOL_NAMES) {
     assert.equal(
@@ -202,6 +203,45 @@ test("injectMemoryAndSkills does not inject server memory tools for stream reque
       `expected ${memoryTool} to be absent for stream requests (client-side MCP path)`
     );
   }
+
+  invalidateMemorySettingsCache();
+});
+
+test("injectMemoryAndSkills does not inject skill tools for stream requests", async () => {
+  const { updateSettings } = await import("../../src/lib/db/settings.ts");
+  const { invalidateMemorySettingsCache } = await import("../../src/lib/memory/settings.ts");
+
+  await updateSettings({ memoryEnabled: true, memoryMaxTokens: 2000, skillsEnabled: true });
+  invalidateMemorySettingsCache();
+
+  const body: Record<string, unknown> = {
+    model: "gpt-4o",
+    stream: true,
+    messages: [{ role: "user", content: "hello" }],
+  };
+
+  const result = await injectMemoryAndSkills({
+    body,
+    memoryOwnerId: "owner-skills-stream",
+    provider: "openai",
+    effectiveModel: "gpt-4o",
+    sourceFormat: FORMATS.OPENAI,
+    targetFormat: FORMATS.OPENAI,
+    backgroundReason: null,
+    log: { debug: () => {} },
+  });
+
+  const tools =
+    (result.body.tools as { function?: { name?: string }; name?: string }[] | undefined) ?? [];
+  const omrSkillTools = tools.filter((tool) => {
+    const name = tool.function?.name ?? tool.name ?? "";
+    return name.startsWith("omr_skill");
+  });
+  assert.equal(
+    omrSkillTools.length,
+    0,
+    "expected no omr_skill_* tools for stream requests (client-side MCP path)"
+  );
 
   invalidateMemorySettingsCache();
 });
@@ -230,7 +270,8 @@ test("injectMemoryAndSkills does not inject memory tools when memory is disabled
     log: { debug: () => {} },
   });
 
-  const tools = (result.body.tools as { function?: { name?: string }; name?: string }[] | undefined) ?? [];
+  const tools =
+    (result.body.tools as { function?: { name?: string }; name?: string }[] | undefined) ?? [];
   const toolNames = tools.map((tool) => tool.function?.name ?? tool.name);
   for (const memoryTool of MEMORY_BUILTIN_TOOL_NAMES) {
     assert.equal(

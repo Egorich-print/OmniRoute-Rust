@@ -6013,7 +6013,9 @@
     "lmarenaWebCookieHint": "Åbn arena.ai, log ind, og kopiér derefter den fulde Cookie-header fra en netværksanmodning. Inkluder arena-auth-prod-v1.0 og arena-auth-prod-v1.1 (og yderligere bidder, hvis de findes), helst med cf_clearance. Indsæt ikke kun den tomme arena-auth-prod-v1-cookie. Valgfrit: providerSpecificData.recaptchaV3Token hvis create-evaluation stadig returnerer 403.",
     "kimiOfficialSupporterBadge": "Grundlæggende ven",
     "kimiOfficialSupporterTooltip": "Kimi (Moonshot AI) er OmniRoutes grundlæggende open source-ven",
-    "kimiPartnerLinkNote": "Partnerlink — understøtter OmniRoute uden ekstra omkostninger for dig"
+    "kimiPartnerLinkNote": "Partnerlink — understøtter OmniRoute uden ekstra omkostninger for dig",
+    "cheaperInferenceSupporterBadge": "Open source-ven",
+    "cheaperInferenceSupporterTooltip": "Cheaper Inference støtter OmniRoute som open source-ven"
   },
   "settings": {
     "title": "Indstillinger",
@@ -12260,5 +12262,6 @@
     "cta": "Hent Kimi Code",
     "partnerLinkNote": "Partnerlink",
     "dismissAriaLabel": "Afvis"
-  }
+  },
+  "featureFlagExposeFunctionalGatewayMirrorsDescription": "__MISSING__:Advertise <gateway-alias>/<model> mirror ids on /v1/models for models whose canonical owner has no active credential but a passthrough gateway with an active credential routes them. Warning: adds catalog entries for all clients when enabled globally."
 }

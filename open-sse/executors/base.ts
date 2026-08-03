@@ -45,6 +45,7 @@ import {
 } from "../services/apiKeyRotator.ts";
 import type { KeyHealth } from "../services/apiKeyRotator.ts";
 import { getOpenAICompatibleType, isClaudeCodeCompatible } from "../services/provider.ts";
+import { usesCcWireImage } from "../services/ccWireImageBuiltins.ts";
 import {
   runWithOnPersist,
   getRefreshLeadMs,
@@ -249,7 +250,10 @@ function collectThinkingConfigs(body: unknown): Array<Record<string, unknown>> {
   if (!body || typeof body !== "object") return [];
   const root = body as Record<string, unknown>;
   const configs: Array<Record<string, unknown>> = [];
-  const envelopes: unknown[] = [root.generationConfig, (root.request as Record<string, unknown> | undefined)?.generationConfig];
+  const envelopes: unknown[] = [
+    root.generationConfig,
+    (root.request as Record<string, unknown> | undefined)?.generationConfig,
+  ];
   for (const env of envelopes) {
     if (!env || typeof env !== "object") continue;
     const tc = (env as Record<string, unknown>).thinkingConfig;
@@ -443,6 +447,12 @@ export class BaseExecutor {
       getRegistryEntry(this.provider),
       credentials?.providerSpecificData
     );
+  }
+
+  protected usesClaudeCodeProtocol(credentials: ProviderCredentials | null): boolean {
+    if (!isClaudeCodeCompatible(this.provider)) return false;
+    const format = this.resolveAlternate(credentials)?.format;
+    return format !== "openai" && format !== "openai-responses";
   }
 
   /**
@@ -834,15 +844,16 @@ export class BaseExecutor {
         );
       }
 
-      const ccRequestDefaults = isClaudeCodeCompatible(this.provider)
+      const usesClaudeCodeProtocol = this.usesClaudeCodeProtocol(requestCredentials);
+      const fingerprintProvider =
+        usesCcWireImage(this.provider) && !usesClaudeCodeProtocol ? "codex" : this.provider;
+      const ccRequestDefaults = usesClaudeCodeProtocol
         ? getClaudeCodeCompatibleRequestDefaults(requestCredentials?.providerSpecificData)
         : {};
       const shouldForwardExtendedContext =
-        extendedContext &&
-        modelSupportsContext1mBeta(model) &&
-        !isClaudeCodeCompatible(this.provider);
+        extendedContext && modelSupportsContext1mBeta(model) && !usesClaudeCodeProtocol;
       const shouldForwardCcCompatibleContext1m =
-        isClaudeCodeCompatible(this.provider) &&
+        usesClaudeCodeProtocol &&
         ccRequestDefaults.context1m === true &&
         !modelHasNativeContext1m(model);
       if (shouldForwardExtendedContext || shouldForwardCcCompatibleContext1m) {
@@ -922,8 +933,8 @@ export class BaseExecutor {
           !activeCredentials?.apiKey;
 
         if (
-          this.provider === "claude" &&
-          (isClaudeCodeClient || hasClaudeOAuthToken) &&
+          ((this.provider === "claude" && (isClaudeCodeClient || hasClaudeOAuthToken)) ||
+            usesClaudeCodeProtocol) &&
           typeof transformedBody === "object" &&
           transformedBody !== null
         ) {
@@ -1200,6 +1211,11 @@ export class BaseExecutor {
             if (ccKeysLower.has(key.toLowerCase())) delete headers[key];
           }
           Object.assign(headers, ccHeaders);
+          if (usesCcWireImage(this.provider) && usesClaudeCodeProtocol) {
+            delete headers["Authorization"];
+            headers["x-api-key"] =
+              activeCredentials?.apiKey || activeCredentials?.accessToken || "";
+          }
           delete headers["X-Stainless-Helper-Method"];
 
           // OS/arch follow the host running the signed binary. Runtime version
@@ -1246,7 +1262,7 @@ export class BaseExecutor {
             // (tool_result must be in immediately next message).
             // Only apply for Claude/Claude-compatible — OpenAI allows results
             // spread across multiple subsequent messages.
-            const isClaude = this.provider === "claude" || isClaudeCodeCompatible(this.provider);
+            const isClaude = this.provider === "claude" || usesClaudeCodeProtocol;
             // For Claude, fixToolAdjacency may strip tool_use blocks whose
             // tool_result isn't in the next message; re-run fixToolPairs to
             // drop any tool_result orphaned by that strip (discussion #2410).
@@ -1265,7 +1281,7 @@ export class BaseExecutor {
         // at this final dispatch point — the single chokepoint every Claude
         // routing mode (grouped/raw/combo) and the native passthrough share,
         // before fingerprinting and CCH signing serialize the body.
-        if (this.provider === "claude" || isClaudeCodeCompatible(this.provider)) {
+        if (this.provider === "claude" || usesClaudeCodeProtocol) {
           enforceThinkingTemperature(transformedBody as Record<string, unknown>);
         }
 
@@ -1282,7 +1298,7 @@ export class BaseExecutor {
         // `contextEditingDisabled` (set by the 400-fallback) suppresses re-injection
         // when a fresh `transformedBody` is built for a retry/fallback URL.
         if (
-          (this.provider === "claude" || isClaudeCodeCompatible(this.provider)) &&
+          (this.provider === "claude" || usesClaudeCodeProtocol) &&
           contextEditing?.enabled &&
           !contextEditingDisabled
         ) {
@@ -1298,17 +1314,17 @@ export class BaseExecutor {
         let bodyString = JSON.stringify(transformedBody);
 
         const shouldFingerprint =
-          isCliCompatEnabled(this.provider) ||
+          isCliCompatEnabled(fingerprintProvider) ||
           (this.provider === "claude" && (isClaudeCodeClient || hasClaudeOAuthToken));
         if (shouldFingerprint) {
-          const fingerprinted = applyFingerprint(this.provider, headers, transformedBody);
+          const fingerprinted = applyFingerprint(fingerprintProvider, headers, transformedBody);
           finalHeaders = fingerprinted.headers;
           bodyString = fingerprinted.bodyString;
         }
 
         // CCH signing — replaces the cch=00000 placeholder in the billing
         // header with an xxHash64 integrity token over the serialized body.
-        if (isClaudeCodeCompatible(this.provider) || this.provider === "claude") {
+        if (usesClaudeCodeProtocol || this.provider === "claude") {
           bodyString = await signRequestBody(bodyString);
         }
 
@@ -1396,7 +1412,7 @@ export class BaseExecutor {
             contextEditingDisabled = true;
             delete (transformedBody as Record<string, unknown>).context_management;
             let retryBody = JSON.stringify(transformedBody);
-            if (isClaudeCodeCompatible(this.provider) || this.provider === "claude") {
+            if (usesClaudeCodeProtocol || this.provider === "claude") {
               retryBody = await signRequestBody(retryBody);
             }
             log?.debug?.(
@@ -1435,7 +1451,7 @@ export class BaseExecutor {
             thinkingBudgetClampedMax = upstreamMax;
             if (clampNestedThinkingBudget(transformedBody, upstreamMax)) {
               let retryBody = JSON.stringify(transformedBody);
-              if (isClaudeCodeCompatible(this.provider) || this.provider === "claude") {
+              if (usesClaudeCodeProtocol || this.provider === "claude") {
                 retryBody = await signRequestBody(retryBody);
               }
               log?.info?.(
@@ -1466,7 +1482,7 @@ export class BaseExecutor {
             strippedFields.add(offending);
             delete (transformedBody as Record<string, unknown>)[offending];
             let retryBody = JSON.stringify(transformedBody);
-            if (isClaudeCodeCompatible(this.provider) || this.provider === "claude") {
+            if (usesClaudeCodeProtocol || this.provider === "claude") {
               retryBody = await signRequestBody(retryBody);
             }
             log?.debug?.(
@@ -1491,7 +1507,7 @@ export class BaseExecutor {
                   addParamToBlocklist(this.provider, autoLearned, model);
                   delete (transformedBody as Record<string, unknown>)[autoLearned];
                   let retryBody = JSON.stringify(transformedBody);
-                  if (isClaudeCodeCompatible(this.provider) || this.provider === "claude") {
+                  if (usesClaudeCodeProtocol || this.provider === "claude") {
                     retryBody = await signRequestBody(retryBody);
                   }
                   log?.info?.(

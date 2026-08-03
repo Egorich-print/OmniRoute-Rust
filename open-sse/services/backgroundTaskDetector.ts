@@ -24,6 +24,7 @@ interface DegradationConfig {
 }
 
 const DEFAULT_DETECTION_PATTERNS = [
+  // English
   "generate a title",
   "generate title",
   "create a title",
@@ -43,6 +44,72 @@ const DEFAULT_DETECTION_PATTERNS = [
   "title for this",
   "suggest a title",
   "label this",
+  // Russian
+  "придумай название",
+  "придумай заголовок",
+  "предложи название",
+  "предложи заголовок",
+  "создай название",
+  "создай заголовок",
+  "составь название",
+  "составь заголовок",
+  "сгенерируй название",
+  "сгенерируй заголовок",
+  "название для",
+  "заголовок для",
+  "название беседы",
+  "название разговора",
+  "назови разговор",
+  "назови беседу",
+  "краткое описание",
+  "короткое описание",
+  "кратко опиши",
+  "коротко опиши",
+  "опиши в двух словах",
+  "в двух словах",
+  "одной строкой",
+  "в одну строку",
+  "одним предложением",
+  "краткое резюме",
+  "сделай краткое",
+  "краткий пересказ",
+  "краткое содержание",
+  "краткое изложение",
+  "подведи итог",
+  "подведи итоги",
+  "подведи краткий итог",
+  "краткий итог",
+  "итог беседы",
+  "суммаризируй",
+  "суммаризация",
+  "сделай саммари",
+  "перефразируй кратко",
+  "кратко",
+  "покороче",
+  // German
+  "titel generieren",
+  "titel für",
+  "überschrift",
+  "kurze beschreibung",
+  "kurz zusammenfassen",
+  "fasse zusammen",
+  "konversation zusammen",
+  "gespräch zusammen",
+  "zusammenfassung",
+  "in einem satz",
+  "eine zeile",
+  "betreff",
+  // French
+  "génère un titre",
+  "titre pour",
+  "résumé",
+  "résume",
+  "résumer",
+  "courte description",
+  "description courte",
+  "en une phrase",
+  "en une ligne",
+  "objet",
 ];
 
 const DEFAULT_DEGRADATION_MAP: Record<string, string> = {
@@ -61,7 +128,35 @@ const DEFAULT_DEGRADATION_MAP: Record<string, string> = {
   "gpt-5": "gpt-5-mini",
   "gpt-5.1": "gpt-5-mini",
   "gpt-5.1-codex": "gpt-5.1-codex-mini",
+  // NVIDIA NIM (full combo ids)
+  "nvidia/nvidia/nemotron-3-ultra-550b-a55b": "nvidia/deepseek-ai/deepseek-v4-flash",
+  "nvidia/nvidia/nemotron-3-super-120b-a12b": "nvidia/deepseek-ai/deepseek-v4-flash",
+  "nvidia/deepseek-ai/deepseek-v4-pro": "nvidia/deepseek-ai/deepseek-v4-flash",
+  // Xiaomi MiMo (full combo id + alias form)
+  "xiaomi-mimo-token-plan/mimo-v2.5-pro": "xiaomi-mimo-token-plan/mimo-v2.5",
+  "mimotp/mimo-v2.5-pro": "mimotp/mimo-v2.5",
+  // DeepSeek direct (alias forms)
+  "if/deepseek-v4-pro": "if/deepseek-v4-flash",
+  "ds/deepseek-v4-pro": "ds/deepseek-v4-flash",
 };
+
+// Tier fallback: when a model is not explicitly mapped but carries a known
+// premium-model marker, degrade to a cheap sibling. Checked only after the exact
+// map lookup misses, and only for requests already classified as background tasks.
+const DEFAULT_TIER_FALLBACK: Array<{ pattern: string; degradedTo: string }> = [
+  { pattern: "nemotron-3-ultra", degradedTo: "nvidia/deepseek-ai/deepseek-v4-flash" },
+  { pattern: "nemotron-3-super", degradedTo: "nvidia/deepseek-ai/deepseek-v4-flash" },
+  { pattern: "deepseek-v4-pro", degradedTo: "nvidia/deepseek-ai/deepseek-v4-flash" },
+  { pattern: "mimo-v2.5-pro", degradedTo: "mimotp/mimo-v2.5" },
+];
+
+// Requests whose total context exceeds this estimated token budget are treated as
+// real work, not utility tasks — never degrade them to a cheap model.
+const CONTEXT_GUARD_TOKENS = 200_000;
+
+// max_tokens below this threshold marks the request as a short/utility task
+// (title generation, summaries) even without a matching system prompt pattern.
+const LOW_MAX_TOKENS_THRESHOLD = 80;
 
 // ── State ───────────────────────────────────────────────────────────────────
 
@@ -153,6 +248,26 @@ function headerValue(headers: Record<string, string> | null, key: string): strin
   return typeof value === "string" ? value.trim() : "";
 }
 
+/** Conservative token estimate over all message content (ASCII chars ≈ 0.25 token, else 1). */
+function estimateContextTokens(messages: BackgroundMessage[]): number {
+  let tokens = 0;
+  for (const message of messages) {
+    const content = message.content;
+    const text =
+      typeof content === "string"
+        ? content
+        : content === null || content === undefined
+          ? ""
+          : JSON.stringify(content);
+    if (!text) continue;
+    for (const character of text) {
+      tokens += character.codePointAt(0)! < 0x80 ? 0.25 : 1;
+      if (tokens >= CONTEXT_GUARD_TOKENS) return CONTEXT_GUARD_TOKENS;
+    }
+  }
+  return tokens;
+}
+
 /**
  * Get reason label when request is a background/utility task.
  *
@@ -178,19 +293,22 @@ export function getBackgroundTaskReason(
     }
   }
 
-  // 2. Very low max tokens usually indicates utility/background tasks
+  // 2. Very large contexts are real work, never a utility task — do not degrade.
+  const messages = toMessageArray(typedBody.messages ?? typedBody.input ?? []);
+  if (Array.isArray(messages) && messages.length > 0) {
+    if (estimateContextTokens(messages) >= CONTEXT_GUARD_TOKENS) return null;
+  }
+
+  // 3. Very low max tokens usually indicates utility/background tasks
   const maxTokens = toFiniteNumber(
     typedBody.max_tokens ?? typedBody.max_completion_tokens ?? typedBody.max_output_tokens
   );
-  if (maxTokens !== null && maxTokens > 0 && maxTokens < 50) {
+  if (maxTokens !== null && maxTokens > 0 && maxTokens < LOW_MAX_TOKENS_THRESHOLD) {
     return "low_max_tokens";
   }
 
-  // 3. Check system prompt for background task patterns
-  const messages = toMessageArray(typedBody.messages ?? typedBody.input ?? []);
+  // 4. Check system prompt for background task patterns
   if (!Array.isArray(messages) || messages.length === 0) return null;
-
-  // Find system message
   const systemMsg = messages.find(
     (message: BackgroundMessage) => message.role === "system" || message.role === "developer"
   );
@@ -208,7 +326,7 @@ export function getBackgroundTaskReason(
 
   if (!matched) return null;
 
-  // 4. Additional heuristic: background tasks typically have very few messages
+  // 5. Additional heuristic: background tasks typically have very few messages
   // (system + 1-2 user messages)
   const userMessages = messages.filter((message: BackgroundMessage) => message.role === "user");
   if (userMessages.length > 3) return null; // Too many turns for a background task
@@ -243,6 +361,14 @@ export function getDegradedModel(originalModel: string): string {
   if (degraded) {
     getConfig().stats.detected++;
     return degraded;
+  }
+
+  // Tier fallback: known premium markers not explicitly mapped → cheap sibling.
+  for (const rule of DEFAULT_TIER_FALLBACK) {
+    if (originalModel.includes(rule.pattern)) {
+      getConfig().stats.detected++;
+      return rule.degradedTo;
+    }
   }
 
   return originalModel;

@@ -6013,7 +6013,9 @@
     "lmarenaWebCookieHint": "arena.aiを開いてサインインし、ネットワークリクエストからCookieヘッダー全体をコピーします。arena-auth-prod-v1.0とarena-auth-prod-v1.1（および存在する場合はそれ以降のチャンク）を含め、できればcf_clearanceも一緒に含めてください。空のarena-auth-prod-v1クッキーのみを貼り付けないでください。オプション: create-evaluationが依然として403を返す場合はproviderSpecificData.recaptchaV3Token。",
     "kimiOfficialSupporterBadge": "創設フレンド",
     "kimiOfficialSupporterTooltip": "Kimi（Moonshot AI）は OmniRoute の創設オープンソースフレンドです",
-    "kimiPartnerLinkNote": "パートナーリンク — 追加費用なしで OmniRoute をサポートします"
+    "kimiPartnerLinkNote": "パートナーリンク — 追加費用なしで OmniRoute をサポートします",
+    "cheaperInferenceSupporterBadge": "オープンソースフレンド",
+    "cheaperInferenceSupporterTooltip": "Cheaper Inference は OmniRoute をオープンソースフレンドとして支援しています"
   },
   "settings": {
     "title": "設定",
@@ -12260,5 +12262,6 @@
     "cta": "Kimi Code を取得",
     "partnerLinkNote": "パートナーリンク",
     "dismissAriaLabel": "閉じる"
-  }
+  },
+  "featureFlagExposeFunctionalGatewayMirrorsDescription": "__MISSING__:Advertise <gateway-alias>/<model> mirror ids on /v1/models for models whose canonical owner has no active credential but a passthrough gateway with an active credential routes them. Warning: adds catalog entries for all clients when enabled globally."
 }

@@ -101,6 +101,22 @@ test("#8969: poe + claude target disables OpenAI stream_options injection", () =
   assert.equal(psd._omnirouteForceResponsesUpstream, undefined);
 });
 
+test("AgentRouter threads the resolved Responses protocol only into execution credentials", () => {
+  const credentials = { providerSpecificData: { apiKeyHealth: {} } };
+  const out = resolveExecutionCredentials({
+    ...base,
+    provider: "agentrouter",
+    targetFormat: RESPONSES,
+    credentials,
+  }) as Record<string, unknown>;
+
+  assert.deepEqual(out.providerSpecificData, {
+    apiKeyHealth: {},
+    targetFormat: RESPONSES,
+  });
+  assert.deepEqual(credentials.providerSpecificData, { apiKeyHealth: {} });
+});
+
 test("ccSessionId is threaded into providerSpecificData when present", () => {
   const out = resolveExecutionCredentials({
     ...base,

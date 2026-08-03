@@ -6013,7 +6013,9 @@
     "lmarenaWebCookieHint": "Otvorte arena.ai, prihláste sa a potom skopírujte celú hlavičku Cookie zo sieťovej požiadavky (Network request). Zahrňte arena-auth-prod-v1.0 a arena-auth-prod-v1.1 (a ďalšie časti, ak sú prítomné), najlepšie s cf_clearance. Nevkladajte iba prázdny cookie arena-auth-prod-v1. Voliteľné: providerSpecificData.recaptchaV3Token, ak create-evaluation stále vracia 403.",
     "kimiOfficialSupporterBadge": "Zakladajúci priateľ",
     "kimiOfficialSupporterTooltip": "Kimi (Moonshot AI) je zakladajúci open source priateľ OmniRoute",
-    "kimiPartnerLinkNote": "Partnerský odkaz — podporuje OmniRoute bez akýchkoľvek dodatočných nákladov pre vás"
+    "kimiPartnerLinkNote": "Partnerský odkaz — podporuje OmniRoute bez akýchkoľvek dodatočných nákladov pre vás",
+    "cheaperInferenceSupporterBadge": "Priateľ open source",
+    "cheaperInferenceSupporterTooltip": "Cheaper Inference podporuje OmniRoute ako priateľ open source"
   },
   "settings": {
     "title": "Nastavenia",
@@ -12260,5 +12262,6 @@
     "cta": "Získať Kimi Code",
     "partnerLinkNote": "Partnerský odkaz",
     "dismissAriaLabel": "Zavrieť"
-  }
+  },
+  "featureFlagExposeFunctionalGatewayMirrorsDescription": "__MISSING__:Advertise <gateway-alias>/<model> mirror ids on /v1/models for models whose canonical owner has no active credential but a passthrough gateway with an active credential routes them. Warning: adds catalog entries for all clients when enabled globally."
 }
