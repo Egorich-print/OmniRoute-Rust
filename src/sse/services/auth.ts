@@ -1644,6 +1644,17 @@ export async function getProviderCredentials(
         return new Date(a.lastUsedAt).getTime() - new Date(b.lastUsedAt).getTime();
       });
       connection = sorted[0];
+      // Update lastUsedAt (reset count to 1) so the least-used account actually
+      // rotates across requests instead of pinning the first one (#rotation-fix).
+      await touchConnectionLastUsed(connection.id, 1);
+      // Sync raw cache row so subsequent calls within TTL see fresh LRU stats
+      for (const r of connectionsRaw as Record<string, unknown>[]) {
+        if (r.id === connection.id) {
+          r.lastUsedAt = new Date().toISOString();
+          r.consecutiveUseCount = 1;
+          break;
+        }
+      }
     } else if (strategy === "cost-optimized") {
       // Cost Optimized: sort by priority ascending (lower = cheaper/preferred)
       // Future: can be enhanced with actual cost data per provider
