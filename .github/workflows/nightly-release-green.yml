@@ -12,7 +12,10 @@ name: Release-Green (continuous)
 #     captain's direct pushes (sync-back — the one ungated write path) AND the merged
 #     COMBINATION right after every PR merge, attributing the offending push range in
 #     the issue. Base-red MTTD drops from ≤24h to ≤~15min after the offending push.
-#   schedule (3×/day) → full --with-build --full-ci (the deep sweep incl. build+suites).
+#   schedule (3×/day) → --quick --full-ci (every static gate from ci.yml, no build/full
+#     suites). The old --with-build --full-ci deep sweep routinely exceeded hosted-runner
+#     limits and died mid-run ("runner received a shutdown signal"), reddening a healthy
+#     branch; suite/build coverage on the release tip is owned by Nightly Node Compat.
 #
 # It is NOT a required status check and never touches a contributor PR — it only
 # reports. Ratchet drift (eslint warnings / cognitive-complexity / file-size) is
@@ -132,15 +135,17 @@ jobs:
           # --hermetic: scrub live-test trigger vars (self-hosted runner may carry
           # operator env; hosted ignores the unknown flag before #6300 lands).
           # push → --quick: fast HARD gates only (~5-8min), per-merge signal.
-          # schedule/dispatch → --with-build --full-ci: ALSO run every static gate from
-          # ci.yml's gate jobs (lint, quality-gate, quality-extended, docs-sync-strict,
-          # pr-test-policy) + build + full suites. PRs into release/** only get the
-          # fast-gates, so these accrue silently and explode in layers on the release PR
-          # (v3.8.46: 11 static base-reds leaked).
+          # schedule/dispatch → --quick --full-ci: every static gate from ci.yml's gate
+          # jobs (lint, quality-gate, quality-extended, docs-sync-strict, pr-test-policy)
+          # but WITHOUT the slow --with-build + full unit/vitest/integration suites. The
+          # full-suite sweep is extremely heavy and routinely gets killed by the hosted
+          # runner mid-run ("runner received a shutdown signal"), turning a healthy branch
+          # into a red scheduled run. Suite/build coverage on the release tip is owned by
+          # the daily Nightly Node Compat matrix + the release PR gate (ci.yml) instead.
           if [ "$EVENT_NAME" = "push" ]; then
             MODE="--quick"
           else
-            MODE="--with-build --full-ci"
+            MODE="--quick --full-ci"
           fi
           echo "[release-green] mode: $MODE (event: $EVENT_NAME)"
           # MODE is an intentional flag list, so word-splitting is wanted here
@@ -242,11 +247,14 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set +e
-          # push (a merge into main) → --quick fast HARD gates; schedule/dispatch → full sweep.
+          # push (a merge into main) → --quick fast HARD gates; schedule/dispatch →
+          # --quick --full-ci (static gates only, no --with-build/full suites — the heavy
+          # sweep gets killed by the hosted runner; suite coverage lives on Nightly Node
+          # Compat + the release PR gate). See release-green job for the rationale.
           if [ "$EVENT_NAME" = "push" ]; then
             MODE="--quick"
           else
-            MODE="--with-build --full-ci"
+            MODE="--quick --full-ci"
           fi
           echo "[main-green] mode: $MODE (event: $EVENT_NAME)"
           # MODE is an intentional flag list, so word-splitting is wanted here
