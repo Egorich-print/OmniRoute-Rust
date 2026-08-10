@@ -157,7 +157,7 @@ jobs:
           cat release-green.log
 
       - name: Open / update tracking issue on HARD failure
-        if: steps.validate.outputs.exit != '0'
+        if: ${{ steps.validate.outputs.exit != '0' && github.repository == 'diegosouzapw/OmniRoute' }}
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET: ${{ steps.branch.outputs.target }}
@@ -266,7 +266,7 @@ jobs:
           cat main-green.log
 
       - name: Open / update tracking issue on HARD failure
-        if: steps.validate.outputs.exit != '0'
+        if: ${{ steps.validate.outputs.exit != '0' && github.repository == 'diegosouzapw/OmniRoute' }}
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -407,7 +407,7 @@ jobs:
           fi
 
       - name: Open / update the banking PR
-        if: steps.verify.outputs.changed == 'true'
+        if: ${{ steps.verify.outputs.changed == 'true' && github.repository == 'diegosouzapw/OmniRoute' }}
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET: ${{ steps.branch.outputs.target }}
