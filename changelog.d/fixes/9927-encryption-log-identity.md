@@ -1,0 +1,1 @@
+- fix(encryption): name failing credential + recovery path in decrypt errors, dedupe per connection (#9927)

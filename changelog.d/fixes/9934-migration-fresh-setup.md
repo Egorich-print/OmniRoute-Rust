@@ -1,0 +1,1 @@
+- fix(migrations): don't abort on fresh install with only the 001 seed (#9934)

@@ -119,8 +119,9 @@ export async function POST(request, { params }) {
   }
 
   const errorPayload = toJsonErrorPayload((result as any).error, "Image generation provider error");
-  return new Response(JSON.stringify(errorPayload), {
-    status: (result as any).status,
-    headers: { "Content-Type": "application/json" },
-  });
+  const message =
+    typeof errorPayload?.error?.message === "string"
+      ? errorPayload.error.message
+      : "Image generation provider error";
+  return errorResponse((result as any).status, message);
 }

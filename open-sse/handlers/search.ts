@@ -336,8 +336,10 @@ function buildExaRequest(
     query: params.query,
     numResults: params.maxResults,
     type: "auto",
-    text: true,
-    highlights: true,
+    contents: {
+      text: true,
+      highlights: true,
+    },
   };
   if (includes.length) body.includeDomains = includes;
   if (excludes.length) body.excludeDomains = excludes;

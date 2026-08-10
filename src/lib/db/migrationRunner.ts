@@ -922,9 +922,26 @@ export function runMigrations(db: SqliteAdapter, options?: { isNewDb?: boolean }
   // interpolates this resolved value, so it auto-reflects any override.
   const maxPendingMigrations = resolveMaxPendingMigrations();
 
+  // #9934: `omniroute setup`'s openOmniRouteDb writes a partial skeleton file
+  // (provider_connections + key_value) that has never had migrations run. When
+  // the first `serve` opens it and auto-seeds only the 001 marker, the applied
+  // set is exactly {001} — which would otherwise look like a wiped existing DB
+  // and trip this abort on a brand-new install. This is distinct from a real
+  // wiped/backup-restored database: that case has a non-trivial physical schema
+  // (baseline inference is non-null) and full data tables, so it still aborts.
+  // The 001-marker-only state on a provider_connections skeleton is the fresh
+  // auto-seed — let it through. A genuinely empty table is already exempt via
+  // `applied.size > 0`, and an upgraded DB has a non-trivial applied set.
+  const isFreshSeedOnly =
+    applied.size === 1 &&
+    applied.has("001") &&
+    inferPhysicalSchemaBaseline(db) === null &&
+    hasTable(db, "provider_connections");
+
   if (
     !isTestEnvironment &&
     !isNewDb &&
+    !isFreshSeedOnly &&
     process.env.DISABLE_SQLITE_AUTO_BACKUP !== "true" &&
     maxPendingMigrations > 0 &&
     applied.size > 0 &&

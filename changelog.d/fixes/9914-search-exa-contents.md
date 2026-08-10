@@ -1,0 +1,1 @@
+- fix(search): nest Exa contents options (text/highlights) for /search API (#9914)

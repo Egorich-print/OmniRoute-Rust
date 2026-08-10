@@ -701,6 +701,67 @@ test("provider-scoped image generation POST uses the shared 401 account fallback
   ]);
 });
 
+test("v1 image generation POST normalizes a terminal upstream 401 to the OpenAI-standard error shape", async () => {
+  await seedConnection("openai", { apiKey: "single-expired-image-key" });
+
+  globalThis.fetch = async (url, options: RequestInit = {}) => {
+    assert.equal(String(url), "https://api.openai.com/v1/images/generations");
+    const authorization = new Headers(options.headers).get("authorization") ?? "";
+    assert.equal(authorization, "Bearer single-expired-image-key");
+    return new Response(JSON.stringify({ error: { message: "expired access token" } }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  const response = await imageRoute.POST(
+    new Request("http://localhost/api/v1/images/generations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "openai/gpt-image-2", prompt: "normalize terminal 401" }),
+    })
+  );
+  const body = (await response.json()) as ErrorResponseBody;
+
+  assert.equal(response.status, 401);
+  assert.deepEqual(body.error, {
+    message: "expired access token",
+    type: "authentication_error",
+    code: "invalid_api_key",
+  });
+});
+
+test("provider-scoped image generation POST normalizes a terminal upstream 401 to the OpenAI-standard error shape", async () => {
+  await seedConnection("openai", { apiKey: "provider-single-expired-key" });
+
+  globalThis.fetch = async (url, options: RequestInit = {}) => {
+    assert.equal(String(url), "https://api.openai.com/v1/images/generations");
+    const authorization = new Headers(options.headers).get("authorization") ?? "";
+    assert.equal(authorization, "Bearer provider-single-expired-key");
+    return new Response(JSON.stringify({ error: { message: "expired provider token" } }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  const response = await providerImageRoute.POST(
+    new Request("http://localhost/api/v1/providers/openai/images/generations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "gpt-image-2", prompt: "normalize provider terminal 401" }),
+    }),
+    { params: Promise.resolve({ provider: "openai" }) }
+  );
+  const body = (await response.json()) as ErrorResponseBody;
+
+  assert.equal(response.status, 401);
+  assert.deepEqual(body.error, {
+    message: "expired provider token",
+    type: "authentication_error",
+    code: "invalid_api_key",
+  });
+});
+
 test("v1 image generation POST refreshes an expired Antigravity token before dispatch", async () => {
   await seedConnection("antigravity", {
     authType: "oauth",
