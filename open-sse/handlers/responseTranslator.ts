@@ -501,6 +501,14 @@ export function translateNonStreamingResponse(
     if (contentBlocks.length > 0) {
       let textContent = "";
       let thinkingContent = "";
+      // Track whether a thinking block carried a non-empty Claude signature. A
+      // thinking-only response (no text/tool_use) with a valid signature is a
+      // real completion — the signature is cryptographic proof the thinking
+      // step ran even when the visible thinking text is empty. Without this the
+      // translation emits `content:""` and `detectMalformedNonStream` flags it
+      // as `empty_choices` → a false 502 for CC-wire providers (e.g. agentrouter
+      // claude-opus-5 extended thinking).
+      let thinkingWithSignature = false;
       const toolCalls: JsonRecord[] = [];
 
       for (const block of contentBlocks) {
@@ -509,6 +517,8 @@ export function translateNonStreamingResponse(
           textContent += toString(blockObj.text);
         } else if (blockObj.type === "thinking") {
           thinkingContent += toString(blockObj.thinking);
+          const sig = toString(blockObj.signature);
+          if (sig.length > 0) thinkingWithSignature = true;
         } else if (blockObj.type === "tool_use") {
           const rawName = toString(blockObj.name);
           const strippedName = caseInsensitiveToolNameLookup(rawName, toolNameMap) ?? rawName;
@@ -542,6 +552,11 @@ export function translateNonStreamingResponse(
       }
       if (thinkingContent) {
         message.reasoning_content = thinkingContent;
+      } else if (thinkingWithSignature) {
+        // Thinking-only with a valid signature: surface a non-empty
+        // reasoning_content marker so downstream validation (`empty_choices`)
+        // treats it as a real completion instead of a malformed response.
+        message.reasoning_content = " ";
       }
       if (toolCalls.length > 0) {
         message.tool_calls = toolCalls;

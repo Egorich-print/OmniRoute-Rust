@@ -406,3 +406,45 @@ test("Claude stream: message_stop falls back to tool_calls when tool use already
 test("Claude stream: unsupported events return null", () => {
   assert.equal(claudeToOpenAIResponse({ type: "error" }, createState()), null);
 });
+
+test("Claude non-stream: thinking-only with a valid signature is not flagged as empty_choices", () => {
+  // CC-wire providers (agentrouter claude-opus-5) can return a thinking-only
+  // response: an empty thinking text paired with a non-empty cryptographic
+  // signature. That is a real completion — it must translate to a
+  // reasoning_content marker so `detectMalformedNonStream` does not 502 it.
+  const result = translateNonStreamingResponse(
+    {
+      id: "msg_think",
+      model: "claude-opus-5",
+      content: [{ type: "thinking", thinking: "", signature: "CAIS5wcK...valid-signature" }],
+      stop_reason: "end_turn",
+      usage: { input_tokens: 100, output_tokens: 0 },
+    },
+    FORMATS.CLAUDE,
+    FORMATS.OPENAI
+  );
+
+  assert.ok(result);
+  const choice = result.choices[0];
+  assert.equal(choice.message.content, "");
+  assert.equal(choice.message.reasoning_content, " ");
+  assert.equal(choice.finish_reason, "stop");
+});
+
+test("Claude non-stream: thinking block without signature still yields empty content (unchanged)", () => {
+  const result = translateNonStreamingResponse(
+    {
+      id: "msg_think2",
+      model: "claude-sonnet",
+      content: [{ type: "thinking", thinking: "" }],
+      stop_reason: "end_turn",
+    },
+    FORMATS.CLAUDE,
+    FORMATS.OPENAI
+  );
+
+  assert.ok(result);
+  const choice = result.choices[0];
+  assert.equal(choice.message.content, "");
+  assert.equal(choice.message.reasoning_content, undefined);
+});
