@@ -216,6 +216,8 @@ export function isLocalProvider(providerId: unknown): boolean {
 }
 
 export const SELF_HOSTED_CHAT_PROVIDER_IDS = new Set([
+  "mlx-gemma",
+  "mlx-qwen",
   "ollama-local",
   "lm-studio",
   "vllm",
@@ -272,6 +274,8 @@ export function providerAllowsOptionalApiKey(providerId: unknown): boolean {
 const BULK_API_KEY_EXCLUDED = new Set([
   "vertex",
   "vertex-partner",
+  "mlx-gemma",
+  "mlx-qwen",
   "ollama-local",
   "grok-web",
   "perplexity-web",
