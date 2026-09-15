@@ -100,14 +100,16 @@ async function main(): Promise<void> {
     assert.equal(writerDrained, true, "call-log write must drain");
     const persisted = await callLogs.getCallLogById(callLogId);
     assert.ok(persisted, "failed attempt must still be available to internal diagnostics");
-    assert.equal(persisted.error, rawDiagnostic);
+    assert.equal(persisted.error, "Error: Provider failed in <path> with api_key='[REDACTED]'");
+    assert.doesNotMatch(persisted.error, /sk-live-dashboard-secret|\/srv\/omniroute|\n/);
 
     console.log(
       RESULT_PREFIX +
         JSON.stringify({
           delivered,
           replayMatches: JSON.stringify(replayed.payload) === JSON.stringify(delivered),
-          internalRawPreserved: persisted.error === rawDiagnostic,
+          internalLogRedacted:
+            persisted.error === delivered.error && !persisted.error.includes("sk-live"),
           writerDrained,
         })
     );

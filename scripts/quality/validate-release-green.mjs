@@ -461,6 +461,37 @@ async function runAsync(cmd, cmdArgs, opts = {}) {
   }
 }
 
+/**
+ * Package-artifact gate, run the way ci.yml's pack job runs it (#10427).
+ *
+ * `check:pack-artifact` assembles dist/ through `build:cli` when staging is missing, and
+ * `build:cli` never writes dist/BUILD_SHA — only `build:release` does. Pointing the ref at
+ * HEAD (PACK_GATE_ENV) is not enough on its own: the guard still stops at "dist/BUILD_SHA is
+ * missing". ci.yml builds, stamps, then validates; mirror that order here. The guard is not
+ * relaxed: an unstamped dist/ or one built from another commit still fails.
+ */
+async function runPackArtifactGate(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  const steps = [
+    { cmd: npmCmd, args: ["run", "build:cli"] },
+    { cmd: process.execPath, args: ["scripts/build/write-build-sha.mjs"] },
+    {
+      cmd: npmCmd,
+      args: ["run", "check:pack-artifact"],
+      env: PACK_GATE_ENV,
+    },
+  ];
+  let out = "";
+  for (const step of steps) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return classifyRunError({ killed: true, signal: "SIGTERM" }, timeoutMs);
+    const result = await runAsync(step.cmd, step.args, { env: step.env, timeout: remaining });
+    out += result.out;
+    if (result.code !== 0) return { code: result.code, out };
+  }
+  return { code: 0, out };
+}
+
 async function main() {
   const args = new Set(process.argv.slice(2));
   const JSON_OUT = args.has("--json");
@@ -713,14 +744,15 @@ async function main() {
       slow.push({
         id: "pack-artifact",
         label: "Package artifact (npm pack policy)",
-        args: ["run", "check:pack-artifact"],
-        env: PACK_GATE_ENV,
+        run: runPackArtifactGate,
         timeout: 20 * 60 * 1000,
       });
     }
     slow.forEach((g) => announce(`${g.label} [parallel]`));
     const slowResults = await Promise.all(
-      slow.map((g) => runAsync(npmCmd, g.args, { timeout: g.timeout, env: g.env }))
+      slow.map((g) =>
+        g.run ? g.run(g.timeout) : runAsync(npmCmd, g.args, { timeout: g.timeout, env: g.env })
+      )
     );
     slow.forEach((g, i) => {
       const { code, out } = slowResults[i];
@@ -770,10 +802,7 @@ async function main() {
     }
   } else if (WITH_BUILD) {
     // --with-build without the suites (--quick): still verify the package artifact.
-    const { code, out } = await runAsync(npmCmd, ["run", "check:pack-artifact"], {
-      env: PACK_GATE_ENV,
-      timeout: 20 * 60 * 1000,
-    });
+    const { code, out } = await runPackArtifactGate(20 * 60 * 1000);
     saveGateLog("pack-artifact", out);
     record({
       id: "pack-artifact",

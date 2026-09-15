@@ -53,6 +53,8 @@ const COGNATES = new Set([
   // "Model" is the correct Croatian and Slovenian word; there is nothing to translate.
   "hr.home.recentRequestsModel",
   "sl.home.recentRequestsModel",
+  // "Model" is also the Uzbek word (plural "modellar"); the catalog uses it consistently.
+  "uz.home.recentRequestsModel",
 ]);
 
 test("home widget keys exist as non-empty strings in every locale catalog", () => {

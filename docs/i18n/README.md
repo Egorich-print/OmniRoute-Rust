@@ -1,9 +1,10 @@
 # 🌐 Multilingual Documentation — OmniRoute
 
-Translations of documentation into 58 languages; together with the English source, the UI supports 59 locales. Code blocks remain in English.
+Translations of documentation into 65 languages; together with the English source, the UI supports 66 locales. Code blocks remain in English.
 
 ---
 
+- 🇪🇹 **አማርኛ** (`am`): [Docs Root](./am/README.md)
 - 🇸🇦 **العربية** (`ar`): [Docs Root](./ar/README.md)
 - 🇦🇿 **Azərbaycan dili** (`az`): [Docs Root](./az/README.md)
 - 🇧🇬 **Български** (`bg`): [Docs Root](./bg/README.md)
@@ -19,13 +20,17 @@ Translations of documentation into 58 languages; together with the English sourc
 - 🇫🇷 **Français** (`fr`): [Docs Root](./fr/README.md)
 - 🇮🇪 **Gaeilge** (`ga`): [Docs Root](./ga/README.md)
 - 🇮🇳 **ગુજરાતી** (`gu`): [Docs Root](./gu/README.md)
+- 🇳🇬 **Hausa** (`ha`): [Docs Root](./ha/README.md)
 - 🇮🇱 **עברית** (`he`): [Docs Root](./he/README.md)
 - 🇮🇳 **हिन्दी** (`hi`): [Docs Root](./hi/README.md)
 - 🇭🇷 **Hrvatski** (`hr`): [Docs Root](./hr/README.md)
 - 🇭🇺 **Magyar** (`hu`): [Docs Root](./hu/README.md)
+- 🇦🇲 **Հայերեն** (`hy`): [Docs Root](./hy/README.md)
 - 🇮🇩 **Bahasa Indonesia** (`id`): [Docs Root](./id/README.md)
+- 🇳🇬 **Igbo** (`ig`): [Docs Root](./ig/README.md)
 - 🇮🇹 **Italiano** (`it`): [Docs Root](./it/README.md)
 - 🇯🇵 **日本語** (`ja`): [Docs Root](./ja/README.md)
+- 🇬🇪 **ქართული** (`ka`): [Docs Root](./ka/README.md)
 - 🇰🇭 **ខ្មែរ** (`km`): [Docs Root](./km/README.md)
 - 🇮🇳 **ಕನ್ನಡ** (`kn`): [Docs Root](./kn/README.md)
 - 🇰🇷 **한국어** (`ko`): [Docs Root](./ko/README.md)
@@ -59,6 +64,8 @@ Translations of documentation into 58 languages; together with the English sourc
 - 🇹🇷 **Türkçe** (`tr`): [Docs Root](./tr/README.md)
 - 🇺🇦 **Українська** (`uk-UA`): [Docs Root](./uk-UA/README.md)
 - 🇵🇰 **اردو** (`ur`): [Docs Root](./ur/README.md)
+- 🇺🇿 **Oʻzbekcha** (`uz`): [Docs Root](./uz/README.md)
 - 🇻🇳 **Tiếng Việt** (`vi`): [Docs Root](./vi/README.md)
+- 🇳🇬 **Yorùbá** (`yo`): [Docs Root](./yo/README.md)
 - 🇹🇼 **中文 (繁體)** (`zh-TW`): [Docs Root](./zh-TW/README.md)
 - 🇨🇳 **中文 (简体)** (`zh-CN`): [Docs Root](./zh-CN/README.md)

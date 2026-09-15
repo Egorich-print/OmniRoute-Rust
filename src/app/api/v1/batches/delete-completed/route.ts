@@ -3,6 +3,7 @@ import { deleteCompletedBatches, type DeleteCompletedBatchesScope } from "@/lib/
 import { validateApiKey } from "@/lib/db/apiKeys";
 import { NextResponse } from "next/server";
 import { getApiKeyRequestScope } from "@/app/api/v1/_helpers/apiKeyScope";
+import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error";
 import * as log from "@/sse/utils/logger";
 
@@ -24,7 +25,11 @@ export async function DELETE(request: Request) {
   // gate (is_active, revoked_at, is_banned, expires_at) — and neither case may
   // fall through to the session branch and widen the sweep to the whole instance.
   if (scope.apiKey && (!scope.apiKeyId || !(await validateApiKey(scope.apiKey)))) {
-    log.warn("BATCHES", "delete-completed: presented API key rejected", {
+    // `info`, not `warn`: any caller can reach this branch by presenting any
+    // string as a key, so a warn-level line per attempt is a log-flooding lever
+    // (LEDGER-12). The 401 itself is the audit signal; the real sweeps below
+    // keep their warn-level audit lines.
+    log.info("BATCHES", "delete-completed: presented API key rejected", {
       route: LOG_ROUTE,
       reason: scope.apiKeyId ? "invalid" : "unresolved",
       apiKeyId: scope.apiKeyId,
@@ -35,6 +40,15 @@ export async function DELETE(request: Request) {
       headers: CORS_HEADERS,
     });
   }
+
+  // The per-key operator policy every other `/v1` route applies (endpoint
+  // allowlist, access schedule, usage cap, rate limit — LEDGER-9/13/16). Runs
+  // after the lifecycle gate above (the enforcer's own status check does not
+  // look at `revoked_at`) and before the sweep scope is chosen, so a restricted
+  // key is refused with the enforcer's own rejection and nothing is swept. A
+  // session-only caller carries no key and passes through untouched.
+  const policy = await enforceApiKeyPolicy(request, null);
+  if (policy.rejection) return policy.rejection;
 
   // A presented API key always scopes the sweep to that key — even when the
   // request also carries a dashboard session cookie — exactly like the

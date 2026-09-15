@@ -7,9 +7,6 @@ const source = readFileSync(
   "utf8"
 );
 
-// #12867 split the send: chatCore keeps the per-attempt admission loop and the
-// account/model recovery loop moved to providerExecutionPipeline.ts, which
-// re-enters chatCore through sendProviderAttempt on every rotation.
 const pipeline = readFileSync(
   new URL("../../open-sse/handlers/chatCore/providerExecutionPipeline.ts", import.meta.url),
   "utf8"
@@ -38,13 +35,14 @@ test("chatCore acquires cumulative gates immediately before withRateLimit", () =
 // single index check covered it; the loop is now split across two files, so the
 // guard checks both halves of the same invariant.
 test("each rotated account attempt acquires and releases a fresh composite slot", () => {
-  // ── chatCore half: one acquisition per attempt, released on every exit ──
-  const attemptLoop = source.indexOf("while (attempts < maxAttempts)");
+  const sendFn = source.indexOf("const executeProviderRequest = async (");
+  const attemptLoop = source.indexOf("while (attempts < maxAttempts)", sendFn);
   const acquire = source.indexOf("await acquireConcurrencyGates(", attemptLoop);
   const release = source.indexOf("releaseAccountSemaphore();", acquire);
   const retryContinue = source.indexOf("continue;", acquire);
 
-  assert.ok(attemptLoop >= 0, "chatCore must keep the per-attempt admission loop");
+  assert.ok(sendFn >= 0, "chatCore must keep the single wire-send function");
+  assert.ok(attemptLoop > sendFn, "the per-attempt admission loop lives in the wire send");
   assert.ok(acquire > attemptLoop, "the composite slot is acquired inside the attempt loop");
   assert.ok(release > acquire, "each attempt must release the composite slot");
   assert.ok(retryContinue > release, "an in-loop retry releases the slot before continuing");
@@ -54,7 +52,12 @@ test("each rotated account attempt acquires and releases a fresh composite slot"
     "a throwing attempt must release the composite slot"
   );
 
-  // ── pipeline half: rotation re-enters the acquisition, never sends in place ──
+  const sendWirings =
+    source.match(
+      /sendProviderAttempt: \(modelToCall, allowDedup\) =>\s*executeProviderRequest\(modelToCall, allowDedup\)/g
+    ) ?? [];
+  assert.equal(sendWirings.length, 2, "both legs send every pipeline attempt through the gate");
+
   const rotationLoop = pipeline.search(/while \(\s*attempts < maxAttempts\b/);
   assert.ok(rotationLoop >= 0, "the account/model recovery loop must exist");
   assert.ok(
@@ -68,8 +71,8 @@ test("each rotated account attempt acquires and releases a fresh composite slot"
   );
   assert.match(
     pipeline.slice(rotationLoop),
-    /(?:antigravityByopRotationPending|authRefreshPending|modelFallbackPending)\s*=\s*true;\s*continue;/,
-    "a rotation hands control back to the loop head instead of re-sending in place"
+    /antigravityByopRotationPending = true;\s*continue;/,
+    "a BYOP rotation hands control back to the loop head instead of re-sending in place"
   );
   assert.match(
     pipeline.slice(rotationLoop),

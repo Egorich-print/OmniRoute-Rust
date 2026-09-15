@@ -15,6 +15,7 @@ import {
   type SyncedAvailableModelInput,
 } from "./models/synced";
 import {
+  deleteSyncedAvailableModelsForProvider,
   finishSyncedAvailableModelsWrite,
   persistCanonicalSyncedAvailableModels,
 } from "./models/syncedAvailableModelPersistence";
@@ -636,22 +637,7 @@ export async function cleanupProviderModelsAfterConnectionDelete(
   return { remainingConnections, removedImportedModelIds, remainingSyncedModels };
 }
 
-/**
- * Delete all synced models for every connection belonging to a provider.
- * Returns the number of connection-scoped synced model lists removed.
- */
-export async function deleteSyncedAvailableModelsForProvider(providerId: string): Promise<number> {
-  const db = getDbInstance();
-  const keyPrefix = `${providerId}:`;
-  const result = db
-    .prepare(
-      "DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND substr(key, 1, ?) = ?"
-    )
-    .run(keyPrefix.length, keyPrefix);
-  const changes = Number(result.changes || 0);
-  if (changes > 0) finishSyncedAvailableModelsWrite();
-  return changes;
-}
+export { deleteSyncedAvailableModelsForProvider };
 
 /**
  * Prune stale synced available models for a provider, keeping only the specified allowed connection IDs.
@@ -957,8 +943,7 @@ export function getHiddenModelsByProvider(modality: string = "chat"): Map<string
                   {
                     isHidden: Boolean(record.isHidden),
                     hiddenModalities: record.hiddenModalities as
-                      | Record<string, boolean>
-                      | undefined,
+                      Record<string, boolean> | undefined,
                   },
                   modality
                 )

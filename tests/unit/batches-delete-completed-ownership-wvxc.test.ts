@@ -15,8 +15,14 @@
  *     empty/missing apiKeyId throws instead of silently widening the sweep;
  *   - batches with `api_key_id IS NULL` are deliberately OUT of a key-scoped
  *     sweep (strict — diverges from the single-batch `scopeCheck` on purpose);
- *   - the sweep is atomic: a failure after the file soft-deletes rolls the file
- *     content back, so no batch row is left pointing at a nulled file;
+ *   - each chunk is atomic: a failure after the file soft-deletes rolls the file
+ *     content of that chunk back, so no batch row is left pointing at a nulled
+ *     file; BOTH modes commit per chunk of INSTANCE_SWEEP_CHUNK ids, so the
+ *     write lock is never held across chunks (omni-code-sec LEDGER-4/20/21);
+ *   - the chunk loop must make progress: a DELETE that silently removes nothing
+ *     throws instead of re-selecting the same chunk forever (LEDGER-22);
+ *   - a scope naming BOTH `apiKeyId` and `allTenants` is rejected by the
+ *     presence of the field, not its truthiness (LEDGER-18);
  *   - a file soft-delete failure is logged, not swallowed, and the batch rows
  *     are still swept.
  *
@@ -164,6 +170,25 @@ describe("deleteCompletedBatches — ownership boundary (GHSA-wvxc-jp3v-5mg5)", 
     );
     assert.ok(getBatch(survivor.batch.id), "a rejected mixed scope must not delete anything");
     deleteCompletedBatches({ apiKeyId: "key_mixed_wvxc" });
+  });
+
+  it("rejects allTenants combined with an EMPTY or NULL apiKeyId too — the field's presence decides, not its truthiness (LEDGER-18)", () => {
+    const survivor = seedCompletedBatch("key_presence_wvxc", "wvxc-presence");
+    assert.throws(
+      () => deleteCompletedBatches({ allTenants: true, apiKeyId: "" } as never),
+      /mutually exclusive/
+    );
+    assert.throws(
+      () => deleteCompletedBatches({ allTenants: true, apiKeyId: null } as never),
+      /mutually exclusive/
+    );
+    assert.ok(getBatch(survivor.batch.id), "a rejected mixed scope must not sweep the instance");
+    assert.strictEqual(
+      getFileContent(survivor.file.id)?.toString(),
+      "wvxc-presence",
+      "a rejected mixed scope must not null file content"
+    );
+    deleteCompletedBatches({ apiKeyId: "key_presence_wvxc" });
   });
 
   it("STRICT: a batch with api_key_id NULL stays out of a key-scoped sweep (diverges from scopeCheck on purpose)", () => {
@@ -354,7 +379,7 @@ describe("deleteCompletedBatches — ownership boundary (GHSA-wvxc-jp3v-5mg5)", 
     }
   });
 
-  it("SEC-D: a key with more than INSTANCE_SWEEP_CHUNK completed batches is swept in one call, atomically", () => {
+  it("SEC-D: a key with more than INSTANCE_SWEEP_CHUNK completed batches is swept in one call, one commit per chunk", () => {
     const total = INSTANCE_SWEEP_CHUNK + 1;
     const own = Array.from({ length: total }, (_, i) => seedCompletedBatch("key-big", `big-${i}`));
     const other = seedCompletedBatch("key-small", "big-other");
@@ -376,32 +401,63 @@ describe("deleteCompletedBatches — ownership boundary (GHSA-wvxc-jp3v-5mg5)", 
     }
     assert.strictEqual(result.deletedBatches, total);
     assert.strictEqual(result.deletedFiles, total);
-    assert.ok(runs >= 3, `outer transaction + 2 chunk units expected, got ${runs}`);
+    assert.strictEqual(runs, 2, "two chunk units (200 + 1) and NO outer transaction");
     for (const s of own) assert.strictEqual(getBatch(s.batch.id), null);
     assert.ok(getBatch(other.batch.id), "another key's batch survives");
   });
 
-  it("SEC-D: a failure in the key sweep's second chunk rolls the WHOLE key sweep back (single atomic transaction)", () => {
+  it("a failure in the key sweep's second chunk keeps chunk 1 committed and rolls chunk 2 back (per-chunk atomicity, same as instance mode)", () => {
     const own = Array.from({ length: INSTANCE_SWEEP_CHUNK + 5 }, (_, i) =>
-      seedCompletedBatch("key-atomic", `atomic-${i}`)
+      seedCompletedBatch("key-perchunk", `perchunk-${i}`)
     );
-    const poison = own[INSTANCE_SWEEP_CHUNK + 2].batch.id;
+    const first = own.slice(0, INSTANCE_SWEEP_CHUNK);
+    const second = own.slice(INSTANCE_SWEEP_CHUNK);
+    const poison = second[2].batch.id;
     const db = getDbInstance();
     // DDL cannot take bound parameters in SQLite; the value is createBatch's generated id.
     db.exec(
       `CREATE TRIGGER wvxc_key_poison BEFORE DELETE ON batches WHEN OLD.id = '${poison}' BEGIN SELECT RAISE(ABORT, 'key poison'); END`
     );
     try {
-      assert.throws(() => deleteCompletedBatches({ apiKeyId: "key-atomic" }), /key poison/);
+      assert.throws(() => deleteCompletedBatches({ apiKeyId: "key-perchunk" }), /key poison/);
     } finally {
       db.exec("DROP TRIGGER IF EXISTS wvxc_key_poison");
     }
-    for (const s of own) {
-      assert.ok(getBatch(s.batch.id), "key sweep is all-or-nothing: chunk 1 rolled back too");
+    for (const s of first) {
+      assert.strictEqual(getBatch(s.batch.id), null, "chunk 1 committed before chunk 2 failed");
+      assert.strictEqual(getFile(s.file.id), null, "chunk 1's file soft-deleted with it");
+    }
+    for (const s of second) {
+      assert.ok(getBatch(s.batch.id), "chunk 2 rolled back as a unit");
       assert.strictEqual(
         getFileContent(s.file.id)?.toString(),
-        s.file.filename.replace(".jsonl", "")
+        s.file.filename.replace(".jsonl", ""),
+        "chunk 2 file content restored"
       );
     }
+    // The survivors are swept normally once the poison is gone.
+    const rest = deleteCompletedBatches({ apiKeyId: "key-perchunk" });
+    assert.strictEqual(rest.deletedBatches, second.length);
+  });
+
+  // Kept LAST on purpose: without the guard this call never returns (a
+  // synchronous loop that node:test's timeout cannot interrupt), so every
+  // earlier result still prints before a hung run is killed.
+  it("FORWARD PROGRESS: a chunk whose DELETE silently removes nothing throws instead of looping forever (LEDGER-22)", () => {
+    const db = getDbInstance();
+    const own = seedCompletedBatch("key-noprog", "noprog-0");
+    // RAISE(IGNORE) turns the DELETE into a silent no-op: the row survives, the
+    // next chunk selects the same id again, and the loop would never end.
+    db.exec(
+      "CREATE TRIGGER wvxc_noprog BEFORE DELETE ON batches WHEN OLD.api_key_id = 'key-noprog' BEGIN SELECT RAISE(IGNORE); END"
+    );
+    try {
+      assert.throws(() => deleteCompletedBatches({ apiKeyId: "key-noprog" }), /no progress/);
+    } finally {
+      db.exec("DROP TRIGGER IF EXISTS wvxc_noprog");
+    }
+    assert.ok(getBatch(own.batch.id), "the row the DELETE ignored is still there");
+    const result = deleteCompletedBatches({ apiKeyId: "key-noprog" });
+    assert.strictEqual(result.deletedBatches, 1, "sweeps normally once the DELETE works again");
   });
 });

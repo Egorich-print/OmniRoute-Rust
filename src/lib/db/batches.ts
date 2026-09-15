@@ -421,7 +421,7 @@ export function deleteBatch(id: string): boolean {
  */
 export type DeleteCompletedBatchesScope = { apiKeyId: string } | { allTenants: true };
 
-/** Instance-wide sweeps commit in chunks of this many batches (SEC-D). */
+/** Both sweep modes commit in chunks of this many batches (SEC-D, LEDGER-4). */
 export const INSTANCE_SWEEP_CHUNK = 200;
 
 /**
@@ -449,18 +449,23 @@ export const INSTANCE_SWEEP_CHUNK = 200;
  * The file soft-deletes, the checkpoint DELETE and the batches DELETE for a set
  * of batch ids run in one transaction, so a mid-sweep failure rolls that set back
  * — within a chunk, no batch row is left pointing at a file whose content was
- * already nulled. Both modes walk the key's/instance's completed batches in
- * chunks of `INSTANCE_SWEEP_CHUNK` ids and run that unit once per chunk.
- * Key mode wraps the whole chunk loop in ONE outer transaction (a nested
- * transaction call is a savepoint on every adapter), so the key sweep stays
- * all-or-nothing: a failure in any chunk rolls every earlier chunk back too.
- * Instance mode (`allTenants`) commits per chunk (SEC-D): a large sweep never
- * holds one write lock over the whole table, each chunk stays atomic, and a
- * failure inside chunk N leaves chunks < N committed, chunk N fully rolled
- * back, and rethrows. Inherent to per-chunk commits: a file shared by batches
- * in two different chunks can be nulled by chunk 1 before chunk 2 fails; the
- * surviving batch row is swept by the next run. The returned totals sum the
- * chunks.
+ * already nulled. BOTH modes walk the key's/instance's completed batches in
+ * chunks of `INSTANCE_SWEEP_CHUNK` ids and commit that unit once per chunk
+ * (SEC-D; key mode since the omni-code-sec proof run, LEDGER-4/20/21): the
+ * SQLite write lock is held for one chunk at a time and never across chunks,
+ * so the lowest-privilege caller — any valid API key — cannot hold the
+ * instance's single writer for the length of its whole sweep. Each chunk stays
+ * atomic: a failure inside chunk N leaves chunks < N committed, chunk N fully
+ * rolled back, and rethrows. Inherent to per-chunk commits, in either mode: a
+ * file shared by batches in two different chunks can be nulled by chunk 1
+ * before chunk 2 fails; the surviving batch row is swept by the next run. The
+ * returned totals sum the chunks.
+ *
+ * The loop must make progress: it remembers the first id of the previous chunk
+ * and throws if the next chunk starts with the same id — the DELETE removed
+ * nothing (e.g. a trigger ignored it), and re-selecting the same rows would
+ * spin forever (LEDGER-22). Rows vanishing under a concurrent deleter are fine:
+ * the next chunk then starts with a different id or is empty.
  *
  * The ids of a unit are bound as `IN (?, …)` placeholders. No statement ever
  * binds more than `INSTANCE_SWEEP_CHUNK` ids in either mode, so a tenant with
@@ -477,17 +482,18 @@ export function deleteCompletedBatches(scope: DeleteCompletedBatchesScope): {
   if (!allTenants && (typeof apiKeyId !== "string" || apiKeyId.trim() === "")) {
     throw new Error("deleteCompletedBatches: apiKeyId required unless allTenants");
   }
-  if (allTenants && apiKeyId) {
+  // Presence, not truthiness: `{ allTenants: true, apiKeyId: "" }` (or null) is a
+  // caller that named both fields and must be refused, not widened (LEDGER-18).
+  if (allTenants && "apiKeyId" in scopeObj) {
     throw new Error("deleteCompletedBatches: apiKeyId and allTenants are mutually exclusive");
   }
 
   const db = getDbInstance();
 
   // One consistent unit: file soft-deletes → checkpoints → batch rows for a
-  // given set of batch ids. Both modes run it per chunk of INSTANCE_SWEEP_CHUNK
-  // ids; key mode nests the chunks in one outer transaction, instance mode
-  // commits each chunk so a large sweep never holds one write-lock for the
-  // whole table (SEC-D) while each chunk stays atomic.
+  // given set of batch ids. Both modes run — and commit — it once per chunk of
+  // INSTANCE_SWEEP_CHUNK ids, so a large sweep never holds one write lock for
+  // the whole table (SEC-D, LEDGER-4) while each chunk stays atomic.
   const sweepIds = db.transaction((ids: string[]) => {
     if (ids.length === 0) return { deletedBatches: 0, deletedFiles: 0 };
     const marks = ids.map(() => "?").join(",");
@@ -529,41 +535,42 @@ export function deleteCompletedBatches(scope: DeleteCompletedBatchesScope): {
     return { deletedBatches: result.changes, deletedFiles };
   });
 
+  // The one chunk loop both modes share: select the next chunk of ids, sweep
+  // it in its own committed transaction, sum. The only difference between the
+  // modes is the SELECT that produces the next chunk. No outer transaction —
+  // the write lock is released between chunks (LEDGER-4/20/21).
+  const sweepLoop = (nextIds: () => string[]) => {
+    const totals = { deletedBatches: 0, deletedFiles: 0 };
+    let previousFirstId: string | null = null;
+    for (;;) {
+      const ids = nextIds();
+      if (ids.length === 0) break;
+      // Forward-progress guard (LEDGER-22): the chunk is re-selected from the
+      // table after each commit, so a repeated first id means the previous
+      // DELETE removed nothing and the loop would spin forever. A concurrent
+      // deleter only makes rows vanish, which yields a different first id.
+      if (ids[0] === previousFirstId) {
+        throw new Error(`deleteCompletedBatches: no progress — chunk repeated (id ${ids[0]})`);
+      }
+      previousFirstId = ids[0];
+      const part = sweepIds(ids);
+      totals.deletedBatches += part.deletedBatches;
+      totals.deletedFiles += part.deletedFiles;
+    }
+    return totals;
+  };
+
+  const toIds = (rows: unknown[]) => (rows as Array<{ id: string }>).map((r) => r.id);
+
   if (!allTenants) {
-    // One outer transaction so the key sweep stays all-or-nothing; inside it,
-    // the same 200-id unit as instance mode (nested transaction calls become
-    // savepoints on every adapter), so no statement ever binds more than
-    // INSTANCE_SWEEP_CHUNK ids — a tenant with tens of thousands of completed
-    // batches must not hit SQLite's 32766 bound-parameter ceiling.
     const keyChunk = db.prepare(
       "SELECT id FROM batches WHERE status = 'completed' AND api_key_id = ? ORDER BY rowid LIMIT ?"
     );
-    const sweepKey = db.transaction(() => {
-      const totals = { deletedBatches: 0, deletedFiles: 0 };
-      for (;;) {
-        const ids = (keyChunk.all(apiKeyId, INSTANCE_SWEEP_CHUNK) as Array<{ id: string }>).map(
-          (r) => r.id
-        );
-        if (ids.length === 0) break;
-        const part = sweepIds(ids);
-        totals.deletedBatches += part.deletedBatches;
-        totals.deletedFiles += part.deletedFiles;
-      }
-      return totals;
-    });
-    return sweepKey();
+    return sweepLoop(() => toIds(keyChunk.all(apiKeyId, INSTANCE_SWEEP_CHUNK)));
   }
 
-  const totals = { deletedBatches: 0, deletedFiles: 0 };
   const nextChunk = db.prepare(
     "SELECT id FROM batches WHERE status = 'completed' ORDER BY rowid LIMIT ?"
   );
-  for (;;) {
-    const ids = (nextChunk.all(INSTANCE_SWEEP_CHUNK) as Array<{ id: string }>).map((r) => r.id);
-    if (ids.length === 0) break;
-    const part = sweepIds(ids);
-    totals.deletedBatches += part.deletedBatches;
-    totals.deletedFiles += part.deletedFiles;
-  }
-  return totals;
+  return sweepLoop(() => toIds(nextChunk.all(INSTANCE_SWEEP_CHUNK)));
 }
