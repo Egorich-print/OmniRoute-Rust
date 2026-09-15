@@ -1,6 +1,6 @@
 # 🌐 Multilingual Documentation — OmniRoute
 
-Translations of documentation into 50 languages; together with the English source, the UI supports 51 locales. Code blocks remain in English.
+Translations of documentation into 58 languages; together with the English source, the UI supports 59 locales. Code blocks remain in English.
 
 ---
 
@@ -26,20 +26,28 @@ Translations of documentation into 50 languages; together with the English sourc
 - 🇮🇩 **Bahasa Indonesia** (`id`): [Docs Root](./id/README.md)
 - 🇮🇹 **Italiano** (`it`): [Docs Root](./it/README.md)
 - 🇯🇵 **日本語** (`ja`): [Docs Root](./ja/README.md)
+- 🇰🇭 **ខ្មែរ** (`km`): [Docs Root](./km/README.md)
+- 🇮🇳 **ಕನ್ನಡ** (`kn`): [Docs Root](./kn/README.md)
 - 🇰🇷 **한국어** (`ko`): [Docs Root](./ko/README.md)
 - 🇱🇹 **Lietuvių** (`lt`): [Docs Root](./lt/README.md)
 - 🇱🇻 **Latviešu** (`lv`): [Docs Root](./lv/README.md)
+- 🇮🇳 **മലയാളം** (`ml`): [Docs Root](./ml/README.md)
 - 🇮🇳 **मराठी** (`mr`): [Docs Root](./mr/README.md)
 - 🇲🇾 **Bahasa Melayu** (`ms`): [Docs Root](./ms/README.md)
 - 🇲🇹 **Malti** (`mt`): [Docs Root](./mt/README.md)
+- 🇲🇲 **မြန်မာ** (`my`): [Docs Root](./my/README.md)
+- 🇳🇵 **नेपाली** (`ne`): [Docs Root](./ne/README.md)
 - 🇳🇱 **Nederlands** (`nl`): [Docs Root](./nl/README.md)
 - 🇳🇴 **Norsk** (`no`): [Docs Root](./no/README.md)
+- 🇮🇳 **ଓଡ଼ିଆ** (`or`): [Docs Root](./or/README.md)
+- 🇮🇳 **ਪੰਜਾਬੀ** (`pa`): [Docs Root](./pa/README.md)
 - 🇵🇭 **Filipino** (`phi`): [Docs Root](./phi/README.md)
 - 🇵🇱 **Polski** (`pl`): [Docs Root](./pl/README.md)
 - 🇵🇹 **Português (Portugal)** (`pt`): [Docs Root](./pt/README.md)
 - 🇧🇷 **Português (Brasil)** (`pt-BR`): [Docs Root](./pt-BR/README.md)
 - 🇷🇴 **Română** (`ro`): [Docs Root](./ro/README.md)
 - 🇷🇺 **Русский** (`ru`): [Docs Root](./ru/README.md)
+- 🇱🇰 **සිංහල** (`si`): [Docs Root](./si/README.md)
 - 🇸🇰 **Slovenčina** (`sk`): [Docs Root](./sk/README.md)
 - 🇸🇮 **Slovenščina** (`sl`): [Docs Root](./sl/README.md)
 - 🇷🇸 **Српски** (`sr`): [Docs Root](./sr/README.md)

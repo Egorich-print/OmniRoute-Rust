@@ -1,6 +1,9 @@
 import { getDbInstance, rowToCamel, objToSnake } from "./core";
-import { deleteFile } from "./files";
+import { deleteFile, deleteFileOwnedBy } from "./files";
 import { v4 as uuidv4 } from "uuid";
+import { logger } from "../../../open-sse/utils/logger.ts";
+
+const log = logger("DB_BATCHES");
 
 function parseBatchRow(row: any): BatchRecord {
   const camel = rowToCamel(row) as any;
@@ -412,71 +415,155 @@ export function deleteBatch(id: string): boolean {
 }
 
 /**
- * Bulk-delete completed batches and the files they reference.
- *
- * `apiKeyId` scopes EVERY statement to that owner. Omitting it keeps the
- * instance-wide sweep, which is legitimate for the operator's own dashboard
- * (session auth) and for nothing else: without the predicate, an ordinary
- * inference key could wipe every tenant's completed batches and null out their
- * file contents (GHSA-wvxc-jp3v-5mg5). Same ownership shape as `listBatches`
- * and `countBatches` above.
+ * Scope of a `deleteCompletedBatches` sweep. The intent is explicit on purpose:
+ * a caller either names the API key whose batches it may sweep, or states
+ * `allTenants: true` — there is no default that widens to the whole instance.
  */
-export function deleteCompletedBatches(apiKeyId?: string | null): {
+export type DeleteCompletedBatchesScope = { apiKeyId: string } | { allTenants: true };
+
+/** Instance-wide sweeps commit in chunks of this many batches (SEC-D). */
+export const INSTANCE_SWEEP_CHUNK = 200;
+
+/**
+ * Delete completed batches and the files they reference.
+ *
+ * `{ apiKeyId }` scopes the sweep to that key's own batches, exactly like
+ * `listBatches`/`countBatches`. `{ allTenants: true }` sweeps the whole instance
+ * and is reserved for an authenticated dashboard session — an ordinary inference
+ * key that reached this without its own id would otherwise delete every tenant's
+ * completed batches and null out their file contents (GHSA-wvxc-jp3v-5mg5). A
+ * missing/empty `apiKeyId` without `allTenants` throws instead of silently
+ * widening the sweep, and a scope carrying BOTH `apiKeyId` and `allTenants` is
+ * rejected rather than widened.
+ *
+ * Batches whose `api_key_id` IS NULL are intentionally OUT of a key-scoped sweep.
+ * This diverges from `scopeCheck` in `src/app/api/v1/batches/[id]/route.ts`,
+ * which lets any key read/delete a single unowned batch by id: a bulk destructive
+ * sweep must never reach records the key does not own, so unowned batches are
+ * only swept by `{ allTenants: true }`.
+ *
+ * In key mode the file half is owner-scoped too: only files whose api_key_id is
+ * the caller's are soft-deleted; a referenced file another tenant owns (or an
+ * unowned one) is left intact and is not counted in deletedFiles.
+ *
+ * The file soft-deletes, the checkpoint DELETE and the batches DELETE for a set
+ * of batch ids run in one transaction, so a mid-sweep failure rolls that set back
+ * — within a chunk, no batch row is left pointing at a file whose content was
+ * already nulled. Both modes walk the key's/instance's completed batches in
+ * chunks of `INSTANCE_SWEEP_CHUNK` ids and run that unit once per chunk.
+ * Key mode wraps the whole chunk loop in ONE outer transaction (a nested
+ * transaction call is a savepoint on every adapter), so the key sweep stays
+ * all-or-nothing: a failure in any chunk rolls every earlier chunk back too.
+ * Instance mode (`allTenants`) commits per chunk (SEC-D): a large sweep never
+ * holds one write lock over the whole table, each chunk stays atomic, and a
+ * failure inside chunk N leaves chunks < N committed, chunk N fully rolled
+ * back, and rethrows. Inherent to per-chunk commits: a file shared by batches
+ * in two different chunks can be nulled by chunk 1 before chunk 2 fails; the
+ * surviving batch row is swept by the next run. The returned totals sum the
+ * chunks.
+ *
+ * The ids of a unit are bound as `IN (?, …)` placeholders. No statement ever
+ * binds more than `INSTANCE_SWEEP_CHUNK` ids in either mode, so a tenant with
+ * tens of thousands of completed batches never hits SQLite's default
+ * SQLITE_MAX_VARIABLE_NUMBER (32766 since 3.32).
+ */
+export function deleteCompletedBatches(scope: DeleteCompletedBatchesScope): {
   deletedBatches: number;
   deletedFiles: number;
 } {
+  const scopeObj = scope && typeof scope === "object" ? scope : {};
+  const allTenants = "allTenants" in scopeObj && scopeObj.allTenants === true;
+  const apiKeyId = "apiKeyId" in scopeObj ? scopeObj.apiKeyId : undefined;
+  if (!allTenants && (typeof apiKeyId !== "string" || apiKeyId.trim() === "")) {
+    throw new Error("deleteCompletedBatches: apiKeyId required unless allTenants");
+  }
+  if (allTenants && apiKeyId) {
+    throw new Error("deleteCompletedBatches: apiKeyId and allTenants are mutually exclusive");
+  }
+
   const db = getDbInstance();
-  const scoped = typeof apiKeyId === "string" && apiKeyId.length > 0;
 
-  // Collect unique file IDs from the completed batches in scope
-  const rows = (
-    scoped
-      ? db
-          .prepare(
-            "SELECT input_file_id, output_file_id, error_file_id FROM batches WHERE status = 'completed' AND api_key_id = ?"
-          )
-          .all(apiKeyId)
-      : db
-          .prepare(
-            "SELECT input_file_id, output_file_id, error_file_id FROM batches WHERE status = 'completed'"
-          )
-          .all()
-  ) as Array<{
-    input_file_id: string | null;
-    output_file_id: string | null;
-    error_file_id: string | null;
-  }>;
+  // One consistent unit: file soft-deletes → checkpoints → batch rows for a
+  // given set of batch ids. Both modes run it per chunk of INSTANCE_SWEEP_CHUNK
+  // ids; key mode nests the chunks in one outer transaction, instance mode
+  // commits each chunk so a large sweep never holds one write-lock for the
+  // whole table (SEC-D) while each chunk stays atomic.
+  const sweepIds = db.transaction((ids: string[]) => {
+    if (ids.length === 0) return { deletedBatches: 0, deletedFiles: 0 };
+    const marks = ids.map(() => "?").join(",");
+    const rows = db
+      .prepare(
+        `SELECT input_file_id, output_file_id, error_file_id FROM batches WHERE id IN (${marks})`
+      )
+      .all(...ids) as Array<{
+      input_file_id: string | null;
+      output_file_id: string | null;
+      error_file_id: string | null;
+    }>;
 
-  const fileIds = new Set<string>();
-  for (const row of rows) {
-    if (row.input_file_id) fileIds.add(row.input_file_id);
-    if (row.output_file_id) fileIds.add(row.output_file_id);
-    if (row.error_file_id) fileIds.add(row.error_file_id);
-  }
-
-  let deletedFiles = 0;
-  for (const fid of fileIds) {
-    try {
-      if (deleteFile(fid)) deletedFiles++;
-    } catch {
-      /* ignore */
+    const fileIds = new Set<string>();
+    for (const row of rows) {
+      if (row.input_file_id) fileIds.add(row.input_file_id);
+      if (row.output_file_id) fileIds.add(row.output_file_id);
+      if (row.error_file_id) fileIds.add(row.error_file_id);
     }
-  }
 
-  if (scoped) {
-    db.prepare(
-      "DELETE FROM batch_item_checkpoints WHERE batch_id IN (SELECT id FROM batches WHERE status = 'completed' AND api_key_id = ?)"
-    ).run(apiKeyId);
-    const result = db
-      .prepare("DELETE FROM batches WHERE status = 'completed' AND api_key_id = ?")
-      .run(apiKeyId);
+    let deletedFiles = 0;
+    for (const fid of fileIds) {
+      try {
+        // Key mode: only the key's OWN files. A batch may reference a file
+        // another tenant (or nobody) owns; a bulk destructive sweep must not
+        // reach it (SEC-C). Instance mode keeps the unconditional soft delete.
+        const removed = allTenants ? deleteFile(fid) : deleteFileOwnedBy(fid, apiKeyId as string);
+        if (removed) deletedFiles++;
+      } catch (err) {
+        log.warn("deleteCompletedBatches: file soft-delete failed", {
+          fid,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    db.prepare(`DELETE FROM batch_item_checkpoints WHERE batch_id IN (${marks})`).run(...ids);
+    const result = db.prepare(`DELETE FROM batches WHERE id IN (${marks})`).run(...ids);
     return { deletedBatches: result.changes, deletedFiles };
+  });
+
+  if (!allTenants) {
+    // One outer transaction so the key sweep stays all-or-nothing; inside it,
+    // the same 200-id unit as instance mode (nested transaction calls become
+    // savepoints on every adapter), so no statement ever binds more than
+    // INSTANCE_SWEEP_CHUNK ids — a tenant with tens of thousands of completed
+    // batches must not hit SQLite's 32766 bound-parameter ceiling.
+    const keyChunk = db.prepare(
+      "SELECT id FROM batches WHERE status = 'completed' AND api_key_id = ? ORDER BY rowid LIMIT ?"
+    );
+    const sweepKey = db.transaction(() => {
+      const totals = { deletedBatches: 0, deletedFiles: 0 };
+      for (;;) {
+        const ids = (keyChunk.all(apiKeyId, INSTANCE_SWEEP_CHUNK) as Array<{ id: string }>).map(
+          (r) => r.id
+        );
+        if (ids.length === 0) break;
+        const part = sweepIds(ids);
+        totals.deletedBatches += part.deletedBatches;
+        totals.deletedFiles += part.deletedFiles;
+      }
+      return totals;
+    });
+    return sweepKey();
   }
 
-  db.prepare(
-    "DELETE FROM batch_item_checkpoints WHERE batch_id IN (SELECT id FROM batches WHERE status = 'completed')"
-  ).run();
-
-  const result = db.prepare("DELETE FROM batches WHERE status = 'completed'").run();
-  return { deletedBatches: result.changes, deletedFiles };
+  const totals = { deletedBatches: 0, deletedFiles: 0 };
+  const nextChunk = db.prepare(
+    "SELECT id FROM batches WHERE status = 'completed' ORDER BY rowid LIMIT ?"
+  );
+  for (;;) {
+    const ids = (nextChunk.all(INSTANCE_SWEEP_CHUNK) as Array<{ id: string }>).map((r) => r.id);
+    if (ids.length === 0) break;
+    const part = sweepIds(ids);
+    totals.deletedBatches += part.deletedBatches;
+    totals.deletedFiles += part.deletedFiles;
+  }
+  return totals;
 }

@@ -224,14 +224,22 @@ async function toOutcome(
   }
   let message = attempt.response.statusText || "upstream error";
   let body: unknown = attempt.transformedBody;
+  // #12867 dropped the upstream error code/type when this leg moved into the
+  // pipeline. Gates that key on both (isAntigravityMissingProjectError) then
+  // stopped firing, and a config-class 422 degraded into an account cooldown.
+  let upstreamCode: string | undefined;
+  let upstreamType: string | undefined;
   try {
     // clone() is the drain. sendProviderAttempt must not cancel() a streaming
     // non-2xx body before we get here (BYOP 422 / Codex 429 Retry-After).
     const text = await attempt.response.clone().text();
     try {
       body = JSON.parse(text);
-      const err = (body as { error?: { message?: unknown } } | null)?.error;
+      const err = (body as { error?: { message?: unknown; code?: unknown; type?: unknown } } | null)
+        ?.error;
       if (err && typeof err.message === "string" && err.message) message = err.message;
+      if (err && typeof err.code === "string" && err.code) upstreamCode = err.code;
+      if (err && typeof err.type === "string" && err.type) upstreamType = err.type;
     } catch {
       // Non-JSON upstream body (plain-text 429, HTML error page). parseUpstreamError
       // — the pre-pipeline path this replaced — surfaces the raw text as the message;
@@ -250,7 +258,13 @@ async function toOutcome(
     body,
     retryAfterMs: null,
   });
-  const result = createErrorResult(restatement.status, message, restatement.retryAfterMs);
+  const result = createErrorResult(
+    restatement.status,
+    message,
+    restatement.retryAfterMs,
+    upstreamCode,
+    upstreamType
+  );
   return {
     kind: "error",
     result: {
