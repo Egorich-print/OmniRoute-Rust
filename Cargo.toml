@@ -1,0 +1,32 @@
+# OmniRoute Rust workspace.
+#
+# This is the foundation of the JS -> Rust rewrite (axum + Tauri v2 + Svelte).
+# It lives next to the existing Next.js/Electron app so the port can proceed
+# crate by crate without breaking the shipping build.
+[workspace]
+resolver = "3"
+members = ["crates/omniroute-core", "crates/omniroute-gateway"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+authors = ["OmniRoute Team"]
+
+[workspace.dependencies]
+omniroute-core = { path = "crates/omniroute-core" }
+
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+futures = "0.3"
+tokio-stream = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

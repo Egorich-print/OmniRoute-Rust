@@ -140,6 +140,10 @@ backup/
 /dist/
 /.next/
 
+# Rust workspace (crates/ + desktop/src-tauri): build artifacts only.
+# Cargo.lock IS committed (workspace ships binaries).
+/target/
+
 # Electron
 electron/dist-electron/
 electron/node_modules/
