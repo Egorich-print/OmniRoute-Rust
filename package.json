@@ -165,6 +165,7 @@
     "i18n:check-value-drift:warn": "node scripts/i18n/check-ui-value-drift.mjs --warn",
     "i18n:check-glossary": "node scripts/i18n/check-glossary-consistency.mjs",
     "i18n:check-glossary:ko": "node scripts/i18n/check-glossary-consistency.mjs --locale=ko",
+    "i18n:check-glossary:ru": "node scripts/i18n/check-glossary-consistency.mjs --locale=ru",
     "i18n:check-ratio": "node scripts/i18n/check-translation-ratio.mjs",
     "i18n:check-ratio:update": "node scripts/i18n/check-translation-ratio.mjs --update",
     "i18n:sync-bars": "node scripts/i18n/sync-language-bars.mjs",

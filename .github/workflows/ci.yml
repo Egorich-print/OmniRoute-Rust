@@ -553,6 +553,7 @@ jobs:
       - uses: ./.github/actions/npm-ci-retry
       - run: node scripts/i18n/check-glossary-consistency.mjs --locale=zh-CN
       - run: node scripts/i18n/check-glossary-consistency.mjs --locale=zh-TW
+      - run: node scripts/i18n/check-glossary-consistency.mjs --locale=ru
 
   # D4 (plano mestre testes+CI): a matrix de ~40 jobs de <1min por idioma saturava sozinha
   # a concorrência de jobs da conta (Free = 20 slots, compartilhados entre TODOS os repos)

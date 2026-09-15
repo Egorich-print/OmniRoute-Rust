@@ -424,6 +424,19 @@ button .material-symbols-outlined,
   animation: spin 1s linear infinite;
 }
 
+/* Keep a spinning Material Symbols glyph on its own axis.
+   The icon font pins `font-size: 24px` regardless of the `size-*` box utility,
+   so the glyph was laid out on the text baseline inside a differently sized box
+   and appeared to orbit rather than spin in place. Centering the line box makes
+   the rotation origin match the glyph's optical center for every `size-*`. */
+.material-symbols-outlined.animate-spin {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  transform-origin: center;
+}
+
 @keyframes pulse {
   0%,
   100% {

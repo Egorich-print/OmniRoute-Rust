@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "locale": "ru",
+  "description": "Canonical ru terminology for recurring OmniRoute concepts. Consumed by scripts/i18n/check-glossary-consistency.mjs. Russian is an inflected language, so product/provider/model names must stay verbatim (Latin script) instead of being transliterated — machine translation produced renderings such as \"Антропная совместимость\" (anthropoid) for \"Anthropic Compatible\", \"Клод\" for \"Claude\", \"Близнецы\" for \"Gemini\" and \"опенай\" for \"OpenAI\". Every `protectedTermMistranslations` entry below was verified to have zero legitimate occurrences in the real ru catalog before being enforced.",
+  "terms": {
+    "provider": {
+      "canonical": "провайдер",
+      "synonyms": []
+    },
+    "key (credential)": {
+      "canonical": "ключ",
+      "synonyms": []
+    },
+    "fallback": {
+      "canonical": "фолбэк",
+      "synonyms": []
+    }
+  },
+  "protectedTermMistranslations": {
+    "Anthropic": ["Антропн", "антропн"],
+    "Claude": ["Клод", "клод"],
+    "Gemini": ["Близнец", "близнец", "Гемини", "гемини"],
+    "Antigravity": ["Антигравитац", "антигравитац"],
+    "OpenAI": ["Опенай", "опенай", "ОпенАй"],
+    "Google": ["Гугл", "гугл"]
+  }
+}

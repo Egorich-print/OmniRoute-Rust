@@ -14,6 +14,17 @@ const spinnerSizes: Record<SpinnerSize, string> = {
   xl: "size-12",
 };
 
+// The Material Symbols font pins `font-size: 24px` in globals.css (an unlayered
+// rule, so Tailwind's layered `text-*` utilities cannot override it). Set the
+// glyph size inline so the icon fills its box and stays optically centered while
+// it spins instead of sitting small on the text baseline.
+const spinnerFontSizes: Record<SpinnerSize, number> = {
+  sm: 16,
+  md: 24,
+  lg: 32,
+  xl: 48,
+};
+
 interface SpinnerProps {
   size?: SpinnerSize;
   className?: string;
@@ -51,6 +62,7 @@ export function Spinner({ size = "md", className, label }: SpinnerProps) {
       <span className="sr-only">{ariaLabel}</span>
       <span
         aria-hidden="true"
+        style={{ fontSize: `${spinnerFontSizes[size]}px` }}
         className={cn(
           "material-symbols-outlined text-primary animate-spin motion-reduce:animate-none",
           spinnerSizes[size]
