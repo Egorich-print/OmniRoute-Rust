@@ -6,6 +6,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/omniroute-core", "crates/omniroute-gateway"]
+# The Tauri desktop app is a heavy, standalone binary app: keep it out of the
+# fast gateway workspace/CI loop. Build it with `cargo tauri` in desktop/.
+exclude = ["desktop/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
