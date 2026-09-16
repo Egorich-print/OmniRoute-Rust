@@ -9,6 +9,7 @@ pub mod auth;
 pub mod backend;
 pub mod grok_cli;
 pub mod ids;
+pub mod openai;
 
 use std::convert::Infallible;
 use std::sync::Arc;

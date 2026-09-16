@@ -12,6 +12,7 @@ use omniroute_core::{
     ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, GatewayError,
     StreamChunk, Usage,
 };
+use serde_json::{Value, json};
 
 /// A boxed, owned stream of deltas.
 pub type ChunkStream = BoxStream<'static, Result<StreamChunk, GatewayError>>;
@@ -30,6 +31,58 @@ pub trait ChatBackend: Send + Sync + 'static {
 
     /// Serve a streaming response as a sequence of deltas.
     fn stream(&self, request: ChatCompletionRequest) -> ChunkStream;
+}
+
+/// Build an OpenAI-shaped request body from a typed request.
+///
+/// Shared by executors that speak OpenAI Chat Completions natively or via a
+/// translator that consumes the same shape.
+pub(crate) fn openai_request_body(request: &ChatCompletionRequest) -> Value {
+    let messages: Vec<Value> = request
+        .messages
+        .iter()
+        .map(|message| json!({"role": message.role, "content": message.content}))
+        .collect();
+    let mut body = json!({
+        "model": request.model,
+        "messages": messages,
+        "stream": request.stream,
+    });
+    if let Some(max_tokens) = request.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    body
+}
+
+/// Reduce an OpenAI `chat.completion.chunk` object to a gateway `StreamChunk`.
+///
+/// Returns `None` for chunks without content, reasoning or finish signal.
+pub(crate) fn openai_chunk_to_stream_chunk(value: &Value) -> Option<StreamChunk> {
+    let choice = value.get("choices")?.get(0)?;
+    let delta = choice.get("delta")?;
+    let content = delta
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let reasoning = delta
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let finish = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if content.is_none() && reasoning.is_none() && finish.is_none() {
+        return None;
+    }
+    Some(StreamChunk {
+        content,
+        reasoning,
+        finish_reason: finish,
+    })
 }
 
 /// Deterministic backend that echoes the last user message.

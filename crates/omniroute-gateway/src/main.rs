@@ -5,13 +5,12 @@ use omniroute_config::GatewayConfig;
 use omniroute_db::Db;
 use omniroute_gateway::{
     AppState, backend::ChatBackend, backend::EchoBackend, build_router_with_state,
-    grok_cli::GrokCliBackend,
+    grok_cli::GrokCliBackend, openai::OpenAiBackend,
 };
 
-/// Select the serving backend. Defaults to the deterministic echo backend;
-/// set `GROK_CLI_TOKEN` (and optionally `GROK_CLI_BASE_URL`) to serve the
-/// real Grok Build endpoint. Connection-driven selection arrives with
-/// routing (Phase 4).
+/// Select the serving backend. `GROK_CLI_TOKEN` wins, then an explicit
+/// OpenAI-compatible endpoint, otherwise the deterministic echo backend.
+/// Connection-driven selection arrives with routing (Phase 4).
 fn select_backend() -> Result<Arc<dyn ChatBackend>, Box<dyn std::error::Error>> {
     match std::env::var("GROK_CLI_TOKEN") {
         Ok(token) if !token.trim().is_empty() => {
@@ -20,10 +19,19 @@ fn select_backend() -> Result<Arc<dyn ChatBackend>, Box<dyn std::error::Error>> 
             tracing::info!("backend: grok-cli ({base_url})");
             Ok(Arc::new(GrokCliBackend::new(base_url, token)?))
         }
-        _ => {
-            tracing::info!("backend: echo (set GROK_CLI_TOKEN for grok-cli)");
-            Ok(Arc::new(EchoBackend))
-        }
+        _ => match std::env::var("OPENAI_COMPAT_BASE_URL") {
+            Ok(base_url) if !base_url.trim().is_empty() => {
+                let api_key = std::env::var("OPENAI_COMPAT_API_KEY").ok();
+                tracing::info!("backend: openai-compatible ({base_url})");
+                Ok(Arc::new(OpenAiBackend::new(base_url, api_key)?))
+            }
+            _ => {
+                tracing::info!(
+                    "backend: echo (set GROK_CLI_TOKEN or OPENAI_COMPAT_BASE_URL for live upstreams)"
+                );
+                Ok(Arc::new(EchoBackend))
+            }
+        },
     }
 }
 

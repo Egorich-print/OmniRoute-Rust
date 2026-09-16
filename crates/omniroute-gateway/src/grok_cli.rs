@@ -20,11 +20,11 @@ use omniroute_translate::{
     requests::openai_to_responses,
     responses::{Converted, ResponsesState, convert_event},
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::backend::{ChatBackend, ChunkStream};
+use crate::backend::{ChatBackend, ChunkStream, openai_chunk_to_stream_chunk, openai_request_body};
 use crate::ids;
 
 /// Grok Build executor over HTTP.
@@ -50,26 +50,6 @@ impl GrokCliBackend {
         format!("{}/responses", self.base_url)
     }
 
-    fn openai_body(request: &ChatCompletionRequest) -> Value {
-        let messages: Vec<Value> = request
-            .messages
-            .iter()
-            .map(|message| json!({"role": message.role, "content": message.content}))
-            .collect();
-        let mut body = json!({
-            "model": request.model,
-            "messages": messages,
-            "stream": request.stream,
-        });
-        if let Some(max_tokens) = request.max_tokens {
-            body["max_tokens"] = json!(max_tokens);
-        }
-        if let Some(temperature) = request.temperature {
-            body["temperature"] = json!(temperature);
-        }
-        body
-    }
-
     async fn drive_stream(
         &self,
         request: ChatCompletionRequest,
@@ -79,7 +59,7 @@ impl GrokCliBackend {
             return Err(GatewayError::InvalidRequest("messages is empty".into()));
         }
 
-        let mut upstream = openai_to_responses(&request.model, &Self::openai_body(&request));
+        let mut upstream = openai_to_responses(&request.model, &openai_request_body(&request));
         upstream["stream"] = Value::from(true);
         let response = self
             .http
@@ -154,7 +134,7 @@ impl ChatBackend for GrokCliBackend {
         if request.messages.is_empty() {
             return Err(GatewayError::InvalidRequest("messages is empty".into()));
         }
-        let mut upstream = openai_to_responses(&request.model, &Self::openai_body(&request));
+        let mut upstream = openai_to_responses(&request.model, &openai_request_body(&request));
         upstream["stream"] = Value::from(false);
         let response = self
             .http
@@ -187,32 +167,6 @@ impl ChatBackend for GrokCliBackend {
         });
         Box::pin(ReceiverStream::new(rx))
     }
-}
-
-/// Reduce a translated OpenAI chunk to the gateway `StreamChunk`.
-fn openai_chunk_to_stream_chunk(value: &Value) -> Option<StreamChunk> {
-    let choice = value.get("choices")?.get(0)?;
-    let delta = choice.get("delta")?;
-    let content = delta
-        .get("content")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let reasoning = delta
-        .get("reasoning_content")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let finish = choice
-        .get("finish_reason")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    if content.is_none() && reasoning.is_none() && finish.is_none() {
-        return None;
-    }
-    Some(StreamChunk {
-        content,
-        reasoning,
-        finish_reason: finish,
-    })
 }
 
 /// Convert a completed Responses API object to a chat completion.
