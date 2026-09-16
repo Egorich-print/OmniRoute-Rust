@@ -5,7 +5,11 @@
 # crate by crate without breaking the shipping build.
 [workspace]
 resolver = "3"
-members = ["crates/omniroute-core", "crates/omniroute-gateway"]
+members = [
+    "crates/omniroute-core",
+    "crates/omniroute-gateway",
+    "crates/omniroute-providers",
+]
 # The Tauri desktop app is a heavy, standalone binary app: keep it out of the
 # fast gateway workspace/CI loop. Build it with `cargo tauri` in desktop/.
 exclude = ["desktop/src-tauri"]
@@ -19,6 +23,7 @@ authors = ["OmniRoute Team"]
 
 [workspace.dependencies]
 omniroute-core = { path = "crates/omniroute-core" }
+omniroute-providers = { path = "crates/omniroute-providers" }
 
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
@@ -29,6 +34,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 futures = "0.3"
 tokio-stream = "0.1"
+insta = "1"
+wiremock = "0.6"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
 
 [profile.release]
 lto = "thin"

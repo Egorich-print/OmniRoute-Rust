@@ -1,0 +1,43 @@
+# Rust rewrite lane.
+#
+# Runs only when Rust sources change, so the main JS rail stays untouched.
+# The Tauri desktop app is intentionally excluded (heavy, standalone);
+# build it with `cargo tauri` in desktop/.
+name: Rust
+
+on:
+  push:
+    branches:
+      - "feat/**"
+      - "fix/**"
+      - "plan/**"
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/rust.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/rust.yml"
+
+jobs:
+  rust:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace

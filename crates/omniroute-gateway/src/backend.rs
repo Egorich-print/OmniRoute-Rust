@@ -6,8 +6,8 @@
 //! executors (grok-cli, OpenAI, Anthropic, ...) are ported over.
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use omniroute_core::{
     ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, GatewayError,
     StreamChunk, Usage,
