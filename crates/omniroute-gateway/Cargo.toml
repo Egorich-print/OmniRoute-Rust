@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 omniroute-config = { workspace = true }
 omniroute-core = { workspace = true }
+omniroute-crypto = { workspace = true }
 omniroute-db = { workspace = true }
 omniroute-http = { workspace = true }
 omniroute-providers = { workspace = true }

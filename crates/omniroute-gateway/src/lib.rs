@@ -8,6 +8,7 @@
 pub mod auth;
 pub mod backend;
 pub mod combos;
+pub mod credentials;
 pub mod grok_cli;
 pub mod ids;
 pub mod openai;

@@ -73,18 +73,47 @@ fn session_headers<'a>(
 pub struct GrokCliBackend {
     http: HttpClient,
     base_url: String,
-    token: String,
+    tokens: Vec<String>,
+    next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl GrokCliBackend {
     /// Build against `base_url` (e.g. `https://cli-chat-proxy.grok.com/v1`)
     /// with a Bearer `token`.
     pub fn new(base_url: String, token: String) -> Result<Self, omniroute_http::client::HttpError> {
+        Self::with_tokens(base_url, vec![token])
+    }
+
+    /// Build with a rotation pool of tokens (ordered by priority). An empty
+    /// pool yields an error: a credential-less executor cannot serve.
+    pub fn with_tokens(
+        base_url: String,
+        tokens: Vec<String>,
+    ) -> Result<Self, omniroute_http::client::HttpError> {
+        if tokens.is_empty() {
+            return Err(omniroute_http::client::HttpError::Status {
+                status: 0,
+                body: "grok-cli: no credentials".to_string(),
+            });
+        }
         Ok(Self {
             http: HttpClient::new(600)?,
             base_url: base_url.trim_end_matches('/').to_string(),
-            token,
+            tokens,
+            next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    /// Pool size (number of rotated credentials).
+    pub fn token_count(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Round-robin token selection.
+    fn next_token(&self) -> &str {
+        let index =
+            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.tokens.len();
+        self.tokens[index].as_str()
     }
 
     fn responses_url(&self) -> String {
@@ -108,7 +137,7 @@ impl GrokCliBackend {
             .http
             .post_json_with_headers(
                 &self.responses_url(),
-                Some(&self.token),
+                Some(self.next_token()),
                 &headers,
                 &upstream,
             )
@@ -186,30 +215,49 @@ impl ChatBackend for GrokCliBackend {
         upstream["stream"] = Value::from(false);
         let user_agent = grok_user_agent();
         let headers = session_headers(&request.model, false, &user_agent);
-        let response = self
-            .http
-            .post_json_with_headers(
-                &self.responses_url(),
-                Some(&self.token),
-                &headers,
-                &upstream,
-            )
-            .await
-            .map_err(|error| GatewayError::Upstream(error.to_string()))?;
-        let payload: Value = response
-            .json()
-            .await
-            .map_err(|error| GatewayError::Upstream(error.to_string()))?;
-        // The upstream may answer errors as JSON with an `error` member even
-        // on 200; surface those instead of an empty completion.
-        if let Some(message) = payload
-            .get("error")
-            .and_then(|error| error.get("message"))
-            .and_then(Value::as_str)
-        {
-            return Err(GatewayError::Upstream(message.to_string()));
+
+        // Try each pooled credential once; a dead/exhausted token should not
+        // fail the request while others are available.
+        let mut last_error: Option<GatewayError> = None;
+        for _ in 0..self.tokens.len() {
+            let response = match self
+                .http
+                .post_json_with_headers(
+                    &self.responses_url(),
+                    Some(self.next_token()),
+                    &headers,
+                    &upstream,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = Some(GatewayError::Upstream(error.to_string()));
+                    continue;
+                }
+            };
+            let payload: Value = match response.json().await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    last_error = Some(GatewayError::Upstream(error.to_string()));
+                    continue;
+                }
+            };
+            // The upstream may answer errors as JSON with an `error` member
+            // even on 200; surface those instead of an empty completion.
+            if let Some(message) = payload
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+            {
+                last_error = Some(GatewayError::Upstream(message.to_string()));
+                continue;
+            }
+            return Ok(response_to_completion(&request.model, &payload));
         }
-        Ok(response_to_completion(&request.model, &payload))
+        Err(last_error.unwrap_or_else(|| {
+            GatewayError::Upstream("grok-cli: all credentials failed".to_string())
+        }))
     }
 
     fn stream(&self, request: ChatCompletionRequest) -> ChunkStream {
@@ -500,5 +548,66 @@ mod tool_tests {
             chunks.last().unwrap().finish_reason.as_deref(),
             Some("tool_calls")
         );
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    use omniroute_core::{ChatCompletionRequest, ChatMessage};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path},
+    };
+
+    #[tokio::test]
+    async fn rotates_past_a_rejected_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer bad"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_json(serde_json::json!({"error": {"message": "invalid token"}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer good"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "id": "resp_ok",
+                    "output": [{"type": "message", "content": [{"type": "output_text", "text": "rotated"}]}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend =
+            GrokCliBackend::with_tokens(server.uri(), vec!["bad".to_string(), "good".to_string()])
+                .unwrap();
+        assert_eq!(backend.token_count(), 2);
+
+        let request = ChatCompletionRequest {
+            model: "grok-4.6".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+        };
+        let response = backend.complete(request).await.unwrap();
+        assert_eq!(response.choices[0].message.content, "rotated");
+    }
+
+    #[test]
+    fn empty_pool_is_rejected() {
+        assert!(GrokCliBackend::with_tokens("http://x".to_string(), vec![]).is_err());
     }
 }

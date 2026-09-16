@@ -993,6 +993,7 @@ name = "omniroute-crypto"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "getrandom 0.4.3",
  "hex",
  "scrypt",
  "sha2",
@@ -1019,6 +1020,7 @@ dependencies = [
  "http-body-util",
  "omniroute-config",
  "omniroute-core",
+ "omniroute-crypto",
  "omniroute-db",
  "omniroute-http",
  "omniroute-providers",

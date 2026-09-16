@@ -68,6 +68,37 @@ impl FieldCrypto {
     pub fn looks_encrypted(value: &str) -> bool {
         value.starts_with(PREFIX)
     }
+    /// Encrypt a value for storage, producing the `enc:v1:` format the JS
+    /// server reads. Values already encrypted pass through unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the OS random source is unavailable, which would make
+    /// the whole process untrustworthy anyway.
+    #[allow(deprecated)]
+    pub fn encrypt(&self, plaintext: &str) -> String {
+        if Self::looks_encrypted(plaintext) {
+            return plaintext.to_string();
+        }
+        let mut iv = [0u8; 16];
+        getrandom::fill(&mut iv).expect("os random source");
+        let cipher =
+            AesGcm::<Aes256, U16>::new(Key::<AesGcm<Aes256, U16>>::from_slice(&self.primary));
+        let nonce = Nonce::<U16>::from_slice(&iv);
+        let payload = cipher
+            .encrypt(nonce, plaintext.as_bytes())
+            .expect("gcm encryption");
+        // The cipher appends the 16-byte tag; the format stores it separately.
+        let split = payload.len() - 16;
+        let (ciphertext, tag) = payload.split_at(split);
+        format!(
+            "{PREFIX}{}:{}:{}",
+            hex::encode(iv),
+            hex::encode(ciphertext),
+            hex::encode(tag)
+        )
+    }
+
     /// Decrypt a stored value. Non-prefixed values pass through unchanged.
     /// Returns `None` when a prefixed value cannot be authenticated.
     pub fn decrypt(&self, value: &str) -> Option<String> {
@@ -231,5 +262,52 @@ mod loader_tests {
         if let Some(previous) = previous {
             unsafe { std::env::set_var("STORAGE_ENCRYPTION_KEY", previous) };
         }
+    }
+}
+
+#[cfg(test)]
+mod encrypt_tests {
+    use super::*;
+
+    const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn round_trips_encrypt_then_decrypt() {
+        let crypto = FieldCrypto::from_secret(SECRET).unwrap();
+        let encrypted = crypto.encrypt("sk-secret-value");
+        assert!(encrypted.starts_with(PREFIX));
+        assert_eq!(
+            crypto.decrypt(&encrypted).as_deref(),
+            Some("sk-secret-value")
+        );
+    }
+
+    #[test]
+    fn encrypt_is_not_idempotent_reuse_safe() {
+        let crypto = FieldCrypto::from_secret(SECRET).unwrap();
+        let a = crypto.encrypt("x");
+        let b = crypto.encrypt("x");
+        assert_ne!(a, b, "random IV per encryption");
+        assert_eq!(crypto.decrypt(&a), crypto.decrypt(&b));
+    }
+
+    #[test]
+    fn already_encrypted_passes_through() {
+        let crypto = FieldCrypto::from_secret(SECRET).unwrap();
+        let once = crypto.encrypt("x");
+        assert_eq!(crypto.encrypt(&once), once);
+    }
+
+    #[test]
+    fn rust_ciphertext_decrypts_via_js_parser_shape() {
+        // The Rust writer must produce a shape the JS `decrypt()` accepts:
+        // three colon-separated hex segments after the prefix.
+        let crypto = FieldCrypto::from_secret(SECRET).unwrap();
+        let encrypted = crypto.encrypt("payload");
+        let body = encrypted.strip_prefix(PREFIX).unwrap();
+        let parts: Vec<&str> = body.split(':').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].len(), 32, "16-byte IV hex");
+        assert_eq!(parts[2].len(), 32, "16-byte tag hex");
     }
 }

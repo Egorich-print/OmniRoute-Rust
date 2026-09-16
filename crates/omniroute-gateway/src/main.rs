@@ -3,34 +3,64 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use omniroute_config::GatewayConfig;
+use omniroute_crypto::{FieldCrypto, load_secret};
 use omniroute_db::Db;
 use omniroute_gateway::{
     AppState, backend::ChatBackend, backend::EchoBackend, build_router_with_state,
-    grok_cli::GrokCliBackend, openai::OpenAiBackend, routing::RoutingBackend,
+    credentials::load_credentials, grok_cli::GrokCliBackend, openai::OpenAiBackend,
+    routing::RoutingBackend,
 };
 use omniroute_providers::ProviderRegistry;
 use omniroute_routing::{RouteRule, Router};
+
+/// Resolve grok-cli tokens: an explicit env token wins, otherwise every
+/// active connection in the database (decrypted, priority-ordered) forms the
+/// rotation pool.
+fn grok_tokens(db: &Db, data_dir: &std::path::Path) -> Vec<String> {
+    if let Ok(token) = std::env::var("GROK_CLI_TOKEN")
+        && !token.trim().is_empty()
+    {
+        return vec![token];
+    }
+    let crypto = load_secret(Some(data_dir)).and_then(|secret| FieldCrypto::from_secret(&secret));
+    let guard = db.connection();
+    match load_credentials(&guard, "grok-cli", crypto.as_ref()) {
+        Ok(credentials) => credentials
+            .into_iter()
+            .map(|credential| credential.token)
+            .collect(),
+        Err(error) => {
+            tracing::warn!("grok-cli credential load failed: {error}");
+            Vec::new()
+        }
+    }
+}
 
 /// Select the serving backend. Builds every configured backend and routes by
 /// model: combo names expand from the database, `grok-*` prefers grok-cli,
 /// everything else prefers an explicit OpenAI-compatible endpoint, and echo
 /// is the ultimate fallback.
-fn select_backend(db: Arc<Db>) -> Result<Arc<dyn ChatBackend>, Box<dyn std::error::Error>> {
+fn select_backend(
+    db: Arc<Db>,
+    data_dir: &std::path::Path,
+) -> Result<Arc<dyn ChatBackend>, Box<dyn std::error::Error>> {
     let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
     backends.insert("echo".to_string(), Arc::new(EchoBackend));
 
     let mut grok_present = false;
-    if let Ok(token) = std::env::var("GROK_CLI_TOKEN")
-        && !token.trim().is_empty()
-    {
+    let tokens = grok_tokens(&db, data_dir);
+    if !tokens.is_empty() {
         let base_url = std::env::var("GROK_CLI_BASE_URL")
             .unwrap_or_else(|_| "https://cli-chat-proxy.grok.com/v1".to_string());
+        tracing::info!(
+            "backend available: grok-cli ({base_url}, {} credential(s))",
+            tokens.len()
+        );
         backends.insert(
             "grok-cli".to_string(),
-            Arc::new(GrokCliBackend::new(base_url.clone(), token)?),
+            Arc::new(GrokCliBackend::with_tokens(base_url, tokens)?),
         );
         grok_present = true;
-        tracing::info!("backend available: grok-cli ({base_url})");
     }
 
     let mut openai_present = false;
@@ -92,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let db = Arc::new(db);
-    let backend = select_backend(db.clone())?;
+    let backend = select_backend(db.clone(), &config.data_dir)?;
     let state = AppState::with_db(backend, db).with_require_auth(config.require_auth);
     let app = build_router_with_state(state);
 
