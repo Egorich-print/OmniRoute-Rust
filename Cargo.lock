@@ -855,6 +855,7 @@ dependencies = [
  "omniroute-core",
  "omniroute-db",
  "omniroute-http",
+ "omniroute-routing",
  "omniroute-translate",
  "omniroute-usage",
  "reqwest",
@@ -888,6 +889,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "omniroute-routing"
+version = "0.1.0"
 
 [[package]]
 name = "omniroute-translate"

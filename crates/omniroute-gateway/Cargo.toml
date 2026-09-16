@@ -10,6 +10,7 @@ omniroute-config = { workspace = true }
 omniroute-core = { workspace = true }
 omniroute-db = { workspace = true }
 omniroute-http = { workspace = true }
+omniroute-routing = { workspace = true }
 omniroute-translate = { workspace = true }
 omniroute-usage = { workspace = true }
 axum = { workspace = true }

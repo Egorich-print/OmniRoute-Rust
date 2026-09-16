@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -5,34 +6,63 @@ use omniroute_config::GatewayConfig;
 use omniroute_db::Db;
 use omniroute_gateway::{
     AppState, backend::ChatBackend, backend::EchoBackend, build_router_with_state,
-    grok_cli::GrokCliBackend, openai::OpenAiBackend,
+    grok_cli::GrokCliBackend, openai::OpenAiBackend, routing::RoutingBackend,
 };
+use omniroute_routing::{RouteRule, Router};
 
-/// Select the serving backend. `GROK_CLI_TOKEN` wins, then an explicit
-/// OpenAI-compatible endpoint, otherwise the deterministic echo backend.
-/// Connection-driven selection arrives with routing (Phase 4).
+/// Select the serving backend. Builds every configured backend and routes by
+/// model: `grok-*` prefers grok-cli, everything else prefers an explicit
+/// OpenAI-compatible endpoint, and echo is the ultimate fallback.
+/// Connection-driven selection arrives with full combo support later.
 fn select_backend() -> Result<Arc<dyn ChatBackend>, Box<dyn std::error::Error>> {
-    match std::env::var("GROK_CLI_TOKEN") {
-        Ok(token) if !token.trim().is_empty() => {
-            let base_url = std::env::var("GROK_CLI_BASE_URL")
-                .unwrap_or_else(|_| "https://cli-chat-proxy.grok.com/v1".to_string());
-            tracing::info!("backend: grok-cli ({base_url})");
-            Ok(Arc::new(GrokCliBackend::new(base_url, token)?))
-        }
-        _ => match std::env::var("OPENAI_COMPAT_BASE_URL") {
-            Ok(base_url) if !base_url.trim().is_empty() => {
-                let api_key = std::env::var("OPENAI_COMPAT_API_KEY").ok();
-                tracing::info!("backend: openai-compatible ({base_url})");
-                Ok(Arc::new(OpenAiBackend::new(base_url, api_key)?))
-            }
-            _ => {
-                tracing::info!(
-                    "backend: echo (set GROK_CLI_TOKEN or OPENAI_COMPAT_BASE_URL for live upstreams)"
-                );
-                Ok(Arc::new(EchoBackend))
-            }
-        },
+    let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
+    backends.insert("echo".to_string(), Arc::new(EchoBackend));
+
+    let mut grok_present = false;
+    if let Ok(token) = std::env::var("GROK_CLI_TOKEN")
+        && !token.trim().is_empty()
+    {
+        let base_url = std::env::var("GROK_CLI_BASE_URL")
+            .unwrap_or_else(|_| "https://cli-chat-proxy.grok.com/v1".to_string());
+        backends.insert(
+            "grok-cli".to_string(),
+            Arc::new(GrokCliBackend::new(base_url.clone(), token)?),
+        );
+        grok_present = true;
+        tracing::info!("backend available: grok-cli ({base_url})");
     }
+
+    let mut openai_present = false;
+    if let Ok(base_url) = std::env::var("OPENAI_COMPAT_BASE_URL")
+        && !base_url.trim().is_empty()
+    {
+        let api_key = std::env::var("OPENAI_COMPAT_API_KEY").ok();
+        backends.insert(
+            "openai-compatible".to_string(),
+            Arc::new(OpenAiBackend::new(base_url.clone(), api_key)?),
+        );
+        openai_present = true;
+        tracing::info!("backend available: openai-compatible ({base_url})");
+    }
+
+    let mut rules = Vec::new();
+    if grok_present {
+        rules.push(RouteRule {
+            model_prefix: "grok-".to_string(),
+            backends: vec!["grok-cli".to_string(), "echo".to_string()],
+        });
+    }
+    let mut default = Vec::new();
+    if openai_present {
+        default.push("openai-compatible".to_string());
+    }
+    default.push("echo".to_string());
+
+    tracing::info!("backend available: echo (fallback)");
+    Ok(Arc::new(RoutingBackend::new(
+        backends,
+        Router::new(rules, default),
+    )))
 }
 
 #[tokio::main]

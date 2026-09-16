@@ -10,6 +10,7 @@ pub mod backend;
 pub mod grok_cli;
 pub mod ids;
 pub mod openai;
+pub mod routing;
 
 use std::convert::Infallible;
 use std::sync::Arc;

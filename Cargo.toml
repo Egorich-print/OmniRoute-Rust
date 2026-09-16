@@ -12,6 +12,7 @@ members = [
     "crates/omniroute-gateway",
     "crates/omniroute-http",
     "crates/omniroute-providers",
+    "crates/omniroute-routing",
     "crates/omniroute-translate",
     "crates/omniroute-usage",
 ]
@@ -32,6 +33,7 @@ omniroute-core = { path = "crates/omniroute-core" }
 omniroute-db = { path = "crates/omniroute-db" }
 omniroute-http = { path = "crates/omniroute-http" }
 omniroute-providers = { path = "crates/omniroute-providers" }
+omniroute-routing = { path = "crates/omniroute-routing" }
 omniroute-translate = { path = "crates/omniroute-translate" }
 omniroute-usage = { path = "crates/omniroute-usage" }
 
