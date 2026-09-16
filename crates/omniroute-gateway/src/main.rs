@@ -8,13 +8,14 @@ use omniroute_gateway::{
     AppState, backend::ChatBackend, backend::EchoBackend, build_router_with_state,
     grok_cli::GrokCliBackend, openai::OpenAiBackend, routing::RoutingBackend,
 };
+use omniroute_providers::ProviderRegistry;
 use omniroute_routing::{RouteRule, Router};
 
 /// Select the serving backend. Builds every configured backend and routes by
-/// model: `grok-*` prefers grok-cli, everything else prefers an explicit
-/// OpenAI-compatible endpoint, and echo is the ultimate fallback.
-/// Connection-driven selection arrives with full combo support later.
-fn select_backend() -> Result<Arc<dyn ChatBackend>, Box<dyn std::error::Error>> {
+/// model: combo names expand from the database, `grok-*` prefers grok-cli,
+/// everything else prefers an explicit OpenAI-compatible endpoint, and echo
+/// is the ultimate fallback.
+fn select_backend(db: Arc<Db>) -> Result<Arc<dyn ChatBackend>, Box<dyn std::error::Error>> {
     let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
     backends.insert("echo".to_string(), Arc::new(EchoBackend));
 
@@ -59,10 +60,10 @@ fn select_backend() -> Result<Arc<dyn ChatBackend>, Box<dyn std::error::Error>> 
     default.push("echo".to_string());
 
     tracing::info!("backend available: echo (fallback)");
-    Ok(Arc::new(RoutingBackend::new(
-        backends,
-        Router::new(rules, default),
-    )))
+    let registry = Arc::new(ProviderRegistry::load());
+    Ok(Arc::new(
+        RoutingBackend::new(backends, Router::new(rules, default)).with_combo_source(db, registry),
+    ))
 }
 
 #[tokio::main]
@@ -90,8 +91,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let backend = select_backend()?;
-    let state = AppState::with_db(backend, Arc::new(db)).with_require_auth(config.require_auth);
+    let db = Arc::new(db);
+    let backend = select_backend(db.clone())?;
+    let state = AppState::with_db(backend, db).with_require_auth(config.require_auth);
     let app = build_router_with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], config.port));

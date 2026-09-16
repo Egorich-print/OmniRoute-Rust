@@ -10,10 +10,12 @@ omniroute-config = { workspace = true }
 omniroute-core = { workspace = true }
 omniroute-db = { workspace = true }
 omniroute-http = { workspace = true }
+omniroute-providers = { workspace = true }
 omniroute-routing = { workspace = true }
 omniroute-translate = { workspace = true }
 omniroute-usage = { workspace = true }
 axum = { workspace = true }
+rusqlite = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 serde = { workspace = true }

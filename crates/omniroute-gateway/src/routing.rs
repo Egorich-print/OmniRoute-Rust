@@ -6,32 +6,37 @@
 //! allowed backend (no mid-stream failover yet); per-attempt usage
 //! attribution is a follow-up, so usage currently records `routing`.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
 use omniroute_core::{ChatCompletionRequest, ChatCompletionResponse, GatewayError};
+use omniroute_db::Db;
+use omniroute_providers::ProviderRegistry;
 use omniroute_routing::{BreakerSet, Router};
 
 use crate::backend::{ChatBackend, ChunkStream};
+use crate::combos::{load_combos, plan_steps};
 
 /// Backend router with failover.
 pub struct RoutingBackend {
-    backends: HashMap<String, std::sync::Arc<dyn ChatBackend>>,
+    backends: HashMap<String, Arc<dyn ChatBackend>>,
     router: Router,
     breakers: Mutex<BreakerSet>,
+    db: Option<Arc<Db>>,
+    registry: Option<Arc<ProviderRegistry>>,
 }
 
 impl RoutingBackend {
     /// Build with default breaker settings (3 failures, 60s cooldown).
-    pub fn new(backends: HashMap<String, std::sync::Arc<dyn ChatBackend>>, router: Router) -> Self {
+    pub fn new(backends: HashMap<String, Arc<dyn ChatBackend>>, router: Router) -> Self {
         Self::with_breaker_settings(backends, router, 3, 60)
     }
 
     /// Build with explicit breaker settings.
     pub fn with_breaker_settings(
-        backends: HashMap<String, std::sync::Arc<dyn ChatBackend>>,
+        backends: HashMap<String, Arc<dyn ChatBackend>>,
         router: Router,
         threshold: u32,
         cooldown_secs: u64,
@@ -40,13 +45,48 @@ impl RoutingBackend {
             backends,
             router,
             breakers: Mutex::new(BreakerSet::new(threshold, cooldown_secs)),
+            db: None,
+            registry: None,
         }
+    }
+
+    /// Attach a database + registry for combo-name expansion.
+    pub fn with_combo_source(mut self, db: Arc<Db>, registry: Arc<ProviderRegistry>) -> Self {
+        self.db = Some(db);
+        self.registry = Some(registry);
+        self
     }
 
     fn lock_breakers(&self) -> std::sync::MutexGuard<'_, BreakerSet> {
         self.breakers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Ordered `(backend, model)` attempts for a requested model name.
+    ///
+    /// A combo name expands to its servable entries (with rewritten model
+    /// ids); anything else falls back to prefix routing with the model
+    /// unchanged. An empty plan means "nothing can serve this".
+    fn plan(&self, model: &str) -> Vec<(String, String)> {
+        if let (Some(db), Some(registry)) = (self.db.as_ref(), self.registry.as_ref()) {
+            let guard = db.connection();
+            let combos = load_combos(&guard);
+            if let Some(combo) = combos.get(model) {
+                let available: HashSet<String> = self.backends.keys().cloned().collect();
+                let steps = plan_steps(combo, registry, &available);
+                if !steps.is_empty() {
+                    return steps;
+                }
+                // No servable entry: fall through to prefix routing so an
+                // under-provisioned combo degrades like an unknown model.
+            }
+        }
+        self.router
+            .route(model)
+            .into_iter()
+            .map(|backend| (backend, model.to_string()))
+            .collect()
     }
 }
 
@@ -63,14 +103,16 @@ impl ChatBackend for RoutingBackend {
         let model = request.model.clone();
         let mut last_error: Option<GatewayError> = None;
 
-        for name in self.router.route(&model) {
+        for (name, target_model) in self.plan(&model) {
             if !self.lock_breakers().allow(&name, Instant::now()) {
                 continue;
             }
             let Some(backend) = self.backends.get(&name) else {
                 continue;
             };
-            match backend.complete(request.clone()).await {
+            let mut attempt = request.clone();
+            attempt.model = target_model;
+            match backend.complete(attempt).await {
                 Ok(response) => {
                     self.lock_breakers().record_success(&name);
                     return Ok(response);
@@ -87,12 +129,14 @@ impl ChatBackend for RoutingBackend {
 
     fn stream(&self, request: ChatCompletionRequest) -> ChunkStream {
         let model = request.model.clone();
-        for name in self.router.route(&model) {
+        for (name, target_model) in self.plan(&model) {
             if !self.lock_breakers().allow(&name, Instant::now()) {
                 continue;
             }
             if let Some(backend) = self.backends.get(&name) {
-                return backend.stream(request);
+                let mut attempt = request.clone();
+                attempt.model = target_model;
+                return backend.stream(attempt);
             }
         }
         Box::pin(futures::stream::once(async move {
@@ -194,5 +238,45 @@ mod tests {
             .collect();
         let text: String = chunks.iter().filter_map(|c| c.content.clone()).collect();
         assert_eq!(text, "echo: hi");
+    }
+
+    #[tokio::test]
+    async fn combo_name_expands_and_rewrites_model() {
+        use omniroute_db::{Db, repos};
+        use omniroute_providers::ProviderRegistry;
+
+        let db = std::sync::Arc::new(Db::open_in_memory().unwrap());
+        db.migrate().unwrap();
+        {
+            let guard = db.connection();
+            repos::upsert_combo(
+                &guard,
+                &repos::ComboRow {
+                    id: "c1".to_string(),
+                    name: "test-combo".to_string(),
+                    data: serde_json::json!({
+                        "strategy": "priority",
+                        "models": [
+                            {"kind": "model", "model": "grok-cli/grok-4.6", "providerId": "grok-cli"},
+                        ],
+                    })
+                    .to_string(),
+                    sort_order: 0,
+                },
+            )
+            .unwrap();
+        }
+
+        let mut backends: HashMap<String, std::sync::Arc<dyn ChatBackend>> = HashMap::new();
+        // Named like the real backend so the plan selects it; echo lets us
+        // observe the rewritten model id in the response.
+        backends.insert("grok-cli".to_string(), std::sync::Arc::new(EchoBackend));
+        backends.insert("echo".to_string(), std::sync::Arc::new(EchoBackend));
+        let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]))
+            .with_combo_source(db, std::sync::Arc::new(ProviderRegistry::load()));
+
+        let response = routing.complete(request("test-combo")).await.unwrap();
+        assert_eq!(response.model, "grok-4.6");
+        assert_eq!(response.choices[0].message.content, "echo: hi");
     }
 }
