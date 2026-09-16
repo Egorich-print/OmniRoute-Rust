@@ -1,0 +1,144 @@
+{
+  "cases": [
+    {
+      "input": {
+        "candidates": [
+          {
+            "content": {
+              "parts": [
+                {
+                  "text": "Hello"
+                }
+              ],
+              "role": "model"
+            }
+          }
+        ],
+        "modelVersion": "gemini-2.5-flash",
+        "responseId": "resp_abc"
+      },
+      "expected": [
+        {
+          "id": "chatcmpl-resp_abc",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "gemini-2.5-flash",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "role": "assistant"
+              },
+              "finish_reason": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-resp_abc",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "gemini-2.5-flash",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "Hello"
+              },
+              "finish_reason": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "input": {
+        "candidates": [
+          {
+            "content": {
+              "parts": [
+                {
+                  "text": " world"
+                }
+              ],
+              "role": "model"
+            }
+          }
+        ]
+      },
+      "expected": [
+        {
+          "id": "chatcmpl-resp_abc",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "gemini-2.5-flash",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " world"
+              },
+              "finish_reason": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "input": {
+        "candidates": [
+          {
+            "content": {
+              "parts": [
+                {
+                  "text": "!"
+                }
+              ],
+              "role": "model"
+            },
+            "finishReason": "STOP"
+          }
+        ],
+        "usageMetadata": {
+          "promptTokenCount": 10,
+          "candidatesTokenCount": 5,
+          "totalTokenCount": 15
+        }
+      },
+      "expected": [
+        {
+          "id": "chatcmpl-resp_abc",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "gemini-2.5-flash",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "!"
+              },
+              "finish_reason": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-resp_abc",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "gemini-2.5-flash",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15
+          }
+        }
+      ]
+    }
+  ]
+}
