@@ -55,12 +55,14 @@ pub struct ChatCompletionResponse {
 /// A single streamed delta, format-agnostic.
 ///
 /// The gateway turns these into SSE frames for the client's wire format.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StreamChunk {
     /// Visible assistant text for this delta, if any.
     pub content: Option<String>,
     /// Reasoning/thinking text for this delta, if any.
     pub reasoning: Option<String>,
+    /// OpenAI-shaped `tool_calls` delta array, forwarded verbatim.
+    pub tool_calls: Option<serde_json::Value>,
     /// Set on the terminal chunk (`"stop"`, `"length"`, ...).
     pub finish_reason: Option<String>,
 }

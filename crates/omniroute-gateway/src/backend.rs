@@ -75,12 +75,14 @@ pub(crate) fn openai_chunk_to_stream_chunk(value: &Value) -> Option<StreamChunk>
         .get("finish_reason")
         .and_then(Value::as_str)
         .map(str::to_string);
-    if content.is_none() && reasoning.is_none() && finish.is_none() {
+    let tool_calls = delta.get("tool_calls").cloned();
+    if content.is_none() && reasoning.is_none() && tool_calls.is_none() && finish.is_none() {
         return None;
     }
     Some(StreamChunk {
         content,
         reasoning,
+        tool_calls,
         finish_reason: finish,
     })
 }
@@ -176,6 +178,30 @@ impl ChatBackend for EchoBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_mapping_carries_tool_calls() {
+        let chunk = openai_chunk_to_stream_chunk(&json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]},
+                "finish_reason": null,
+            }],
+        }))
+        .expect("chunk present");
+        assert!(chunk.tool_calls.is_some());
+        assert!(chunk.content.is_none());
+    }
+
+    #[test]
+    fn chunk_mapping_drops_empty_deltas() {
+        assert!(
+            openai_chunk_to_stream_chunk(&json!({
+                "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
+            }))
+            .is_none()
+        );
+    }
 
     fn request(text: &str) -> ChatCompletionRequest {
         ChatCompletionRequest {

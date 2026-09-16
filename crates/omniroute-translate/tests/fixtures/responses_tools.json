@@ -1,0 +1,129 @@
+{
+  "state": {
+    "chat_id": "chatcmpl-test-002",
+    "created": 1700000000,
+    "model": "grok-4.6"
+  },
+  "cases": [
+    {
+      "input": {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "type": "function_call",
+          "id": "item_1",
+          "call_id": "call_1",
+          "name": "get_time",
+          "arguments": ""
+        }
+      },
+      "expected": {
+        "id": "chatcmpl-test-002",
+        "object": "chat.completion.chunk",
+        "created": 1700000000,
+        "model": "grok-4.6",
+        "choices": [
+          {
+            "index": 0,
+            "delta": {
+              "tool_calls": [
+                {
+                  "index": 0,
+                  "id": "call_1",
+                  "type": "function",
+                  "function": {
+                    "name": "get_time",
+                    "arguments": ""
+                  }
+                }
+              ],
+              "role": "assistant"
+            },
+            "finish_reason": null
+          }
+        ]
+      }
+    },
+    {
+      "input": {
+        "type": "response.function_call_arguments.delta",
+        "output_index": 0,
+        "delta": "{\"city\":"
+      },
+      "expected": null
+    },
+    {
+      "input": {
+        "type": "response.function_call_arguments.delta",
+        "output_index": 0,
+        "delta": "\"SF\"}"
+      },
+      "expected": null
+    },
+    {
+      "input": {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "type": "function_call",
+          "id": "item_1",
+          "call_id": "call_1",
+          "name": "get_time",
+          "arguments": ""
+        }
+      },
+      "expected": {
+        "id": "chatcmpl-test-002",
+        "object": "chat.completion.chunk",
+        "created": 1700000000,
+        "model": "grok-4.6",
+        "choices": [
+          {
+            "index": 0,
+            "delta": {
+              "tool_calls": [
+                {
+                  "index": 0,
+                  "function": {
+                    "arguments": "{\"city\":\"SF\"}"
+                  }
+                }
+              ]
+            },
+            "finish_reason": null
+          }
+        ]
+      }
+    },
+    {
+      "input": {
+        "type": "response.completed",
+        "response": {
+          "usage": {
+            "input_tokens": 20,
+            "output_tokens": 10,
+            "total_tokens": 30
+          }
+        }
+      },
+      "expected": {
+        "id": "chatcmpl-test-002",
+        "object": "chat.completion.chunk",
+        "created": 1700000000,
+        "model": "grok-4.6",
+        "choices": [
+          {
+            "index": 0,
+            "delta": {},
+            "finish_reason": "tool_calls"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 20,
+          "completion_tokens": 10,
+          "total_tokens": 30
+        }
+      }
+    }
+  ]
+}

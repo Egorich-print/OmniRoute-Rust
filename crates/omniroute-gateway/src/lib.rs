@@ -212,6 +212,9 @@ fn chunk_event(id: &str, created: i64, model: &str, chunk: &StreamChunk) -> Even
     if let Some(reasoning) = &chunk.reasoning {
         delta.insert("reasoning_content".into(), json!(reasoning));
     }
+    if let Some(tool_calls) = &chunk.tool_calls {
+        delta.insert("tool_calls".into(), tool_calls.clone());
+    }
 
     let payload = json!({
         "id": id,

@@ -1,14 +1,29 @@
 //! Streaming `openai-responses → openai` conversion.
 //!
 //! Mirrors `openaiResponsesToOpenAIResponseStream` in
-//! `open-sse/translator/response/openai-responses.ts` for the text path:
-//! `response.output_text.delta` becomes a content delta,
-//! `response.reasoning_*_text.delta` becomes `reasoning_content`, and the
-//! first `response.completed` becomes the terminal finish chunk with usage.
-//! Tool-call synthesis and namespaces are follow-ups, not silent behaviour
-//! changes: unknown event kinds are ignored (`Ignored`), never fabricated.
+//! `open-sse/translator/response/openai-responses.ts`: text and reasoning
+//! deltas, incremental function calls (`.added` announces with index/id,
+//! `.delta` buffers arguments, `.done` emits them), and the terminal
+//! `response.completed` event.
+//!
+//! Explicitly deferred: `completed`-snapshot tool synthesis, namespaces,
+//! Agent argument normalisation, and reasoning-summary deltas beyond the
+//! plain `reasoning_content` mapping. Unknown event kinds are ignored,
+//! never fabricated.
 
 use serde_json::{Value, json};
+use std::collections::HashMap;
+
+/// In-flight function call tracked across `.added`/`.delta`/`.done` events.
+#[derive(Debug, Clone, Default)]
+pub struct ToolCallEntry {
+    /// Assigned OpenAI index (`None` until the name resolves).
+    pub index: Option<u32>,
+    /// Normalized tool name (empty while deferred).
+    pub name: String,
+    /// Buffered `arguments` fragments.
+    pub args: String,
+}
 
 /// Mutable per-stream conversion state (the JS translator's `state`).
 #[derive(Debug, Clone)]
@@ -23,6 +38,18 @@ pub struct ResponsesState {
     pub role_sent: bool,
     /// Whether the terminal finish chunk already went out.
     pub finish_sent: bool,
+    /// Next tool-call index to assign.
+    pub tool_call_index: u32,
+    /// In-flight calls by `call_id`.
+    pub tool_calls: HashMap<String, ToolCallEntry>,
+    /// `item.id` → `call_id` reverse map.
+    pub item_to_call: HashMap<String, String>,
+    /// `output_index` → `call_id` reverse map.
+    pub output_index_to_call: HashMap<i64, String>,
+    /// Most recently opened call, fallback for unidentified deltas.
+    pub current_tool_call: Option<String>,
+    /// Monotonic fallback id sequence (deterministic; JS uses timestamps).
+    pub fallback_seq: u64,
 }
 
 impl ResponsesState {
@@ -34,7 +61,18 @@ impl ResponsesState {
             model,
             role_sent: false,
             finish_sent: false,
+            tool_call_index: 0,
+            tool_calls: HashMap::new(),
+            item_to_call: HashMap::new(),
+            output_index_to_call: HashMap::new(),
+            current_tool_call: None,
+            fallback_seq: 0,
         }
+    }
+
+    fn fallback_call_id(&mut self) -> String {
+        self.fallback_seq += 1;
+        format!("call_fallback_{}", self.fallback_seq)
     }
 }
 
@@ -82,13 +120,198 @@ pub fn convert_event(state: &mut ResponsesState, event_type: &str, data: &Value)
             Converted::Emit(delta_chunk(state, None, Some(text)))
         }
         "response.output_text.done" => Converted::Ignore,
+        "response.output_item.added" => {
+            let Some(item) = data.get("item") else {
+                return Converted::Ignore;
+            };
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                return Converted::Ignore;
+            }
+            let mut call_id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if call_id.is_empty() {
+                call_id = state.fallback_call_id();
+            }
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if let Some(item_id) = item.get("id").and_then(Value::as_str) {
+                state
+                    .item_to_call
+                    .insert(item_id.to_string(), call_id.clone());
+            }
+            if let Some(output_index) = data.get("output_index").and_then(Value::as_i64) {
+                state
+                    .output_index_to_call
+                    .insert(output_index, call_id.clone());
+            }
+            state.current_tool_call = Some(call_id.clone());
+
+            let entry = state
+                .tool_calls
+                .entry(call_id.clone())
+                .or_insert_with(|| ToolCallEntry {
+                    index: None,
+                    name: name.clone(),
+                    args: String::new(),
+                });
+            entry.name = name.clone();
+            if name.is_empty() {
+                // Deferred: emit once output_item.done resolves a name.
+                return Converted::Ignore;
+            }
+            if entry.index.is_none() {
+                entry.index = Some(state.tool_call_index);
+                state.tool_call_index += 1;
+            }
+            let index = entry.index.unwrap_or(0);
+            Converted::Emit(tool_chunk(
+                state,
+                json!([{
+                    "index": index,
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": ""},
+                }]),
+            ))
+        }
+        "response.function_call_arguments.delta" => {
+            let text = data.get("delta").and_then(Value::as_str).unwrap_or("");
+            if text.is_empty() {
+                return Converted::Ignore;
+            }
+            // Resolve the in-flight call: item_id, then output_index, then the
+            // single open call, then the most recent one. Buffered, never
+            // emitted directly (see output_item.done).
+            let mut call_id: Option<String> = None;
+            if let Some(item_id) = data.get("item_id").and_then(Value::as_str) {
+                call_id = state.item_to_call.get(item_id).cloned();
+            }
+            if call_id.is_none()
+                && let Some(output_index) = data.get("output_index").and_then(Value::as_i64)
+            {
+                call_id = state.output_index_to_call.get(&output_index).cloned();
+            }
+            if call_id.is_none() {
+                if state.tool_calls.len() == 1 {
+                    call_id = state.tool_calls.keys().next().cloned();
+                } else {
+                    call_id = state.current_tool_call.clone();
+                }
+            }
+            if let Some(id) = call_id
+                && let Some(entry) = state.tool_calls.get_mut(&id)
+            {
+                entry.args.push_str(text);
+            }
+            Converted::Ignore
+        }
+        "response.output_item.done" => {
+            let Some(item) = data.get("item") else {
+                return Converted::Ignore;
+            };
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                return Converted::Ignore;
+            }
+            let mut call_id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if call_id.is_none()
+                && let Some(item_id) = item.get("id").and_then(Value::as_str)
+            {
+                call_id = state.item_to_call.get(item_id).cloned();
+            }
+            if call_id.is_none() {
+                call_id = state.current_tool_call.clone();
+            }
+            let call_id = call_id.unwrap_or_else(|| state.fallback_call_id());
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            // Claim an index if .added never assigned one.
+            let index = match state.tool_calls.get_mut(&call_id) {
+                Some(entry) => {
+                    if entry.index.is_none() && !name.is_empty() {
+                        entry.index = Some(state.tool_call_index);
+                        state.tool_call_index += 1;
+                    }
+                    if !name.is_empty() {
+                        entry.name = name.clone();
+                    }
+                    entry.index
+                }
+                None => {
+                    if name.is_empty() {
+                        return Converted::Ignore;
+                    }
+                    let index = state.tool_call_index;
+                    state.tool_call_index += 1;
+                    state.tool_calls.insert(
+                        call_id.clone(),
+                        ToolCallEntry {
+                            index: Some(index),
+                            name: name.clone(),
+                            args: String::new(),
+                        },
+                    );
+                    Some(index)
+                }
+            };
+            let Some(index) = index else {
+                // Deferred call whose name never resolved.
+                state.tool_calls.remove(&call_id);
+                if state.current_tool_call.as_deref() == Some(call_id.as_str()) {
+                    state.current_tool_call = None;
+                }
+                return Converted::Ignore;
+            };
+
+            // Prefer the completed arguments; fall back to buffered deltas.
+            // (Schema-aware null normalisation is deferred; it only affects
+            // the Agent tool family.)
+            let buffered = state
+                .tool_calls
+                .get(&call_id)
+                .map(|entry| entry.args.clone())
+                .unwrap_or_default();
+            let item_args = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+            let arguments = if !item_args.is_empty() {
+                item_args.to_string()
+            } else {
+                buffered
+            };
+
+            state.tool_calls.remove(&call_id);
+            if state.current_tool_call.as_deref() == Some(call_id.as_str()) {
+                state.current_tool_call = None;
+            }
+
+            Converted::Emit(tool_chunk(
+                state,
+                json!([{
+                    "index": index,
+                    "function": {"arguments": arguments},
+                }]),
+            ))
+        }
         "response.completed" => {
             if state.finish_sent {
                 return Converted::Ignore;
             }
             state.finish_sent = true;
             let usage = extract_usage(data);
-            Converted::Emit(finish_chunk(state, "stop", usage))
+            Converted::Emit(finish_chunk(state, compute_finish_reason(state), usage))
         }
         "response.failed" | "error" => {
             state.finish_sent = true;
@@ -116,6 +339,36 @@ fn delta_chunk(
     if let Some(text) = reasoning {
         delta.insert("reasoning_content".to_string(), Value::from(text));
     }
+    json!({
+        "id": state.chat_id,
+        "object": "chat.completion.chunk",
+        "created": state.created,
+        "model": state.model,
+        "choices": [{
+            "index": 0,
+            "delta": Value::Object(delta),
+            "finish_reason": null,
+        }],
+    })
+}
+
+/// Terminal reason: `tool_calls` once any call opened, else `stop`.
+fn compute_finish_reason(state: &ResponsesState) -> &'static str {
+    if state.tool_call_index > 0 || state.current_tool_call.is_some() {
+        "tool_calls"
+    } else {
+        "stop"
+    }
+}
+
+/// Build a tool-calls delta chunk, announcing the role on the first chunk.
+fn tool_chunk(state: &mut ResponsesState, tool_calls: Value) -> Value {
+    let mut delta = serde_json::Map::new();
+    if !state.role_sent {
+        delta.insert("role".to_string(), Value::from("assistant"));
+        state.role_sent = true;
+    }
+    delta.insert("tool_calls".to_string(), tool_calls);
     json!({
         "id": state.chat_id,
         "object": "chat.completion.chunk",

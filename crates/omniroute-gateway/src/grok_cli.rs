@@ -427,3 +427,78 @@ mod tests {
         assert!(error.to_string().contains("boom"));
     }
 }
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+    use futures::StreamExt;
+    use omniroute_core::{ChatCompletionRequest, ChatMessage};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    #[tokio::test]
+    async fn streams_incremental_tool_call_arguments() {
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"get_time\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"city\\\":\"}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"\\\"SF\\\"}\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"get_time\",\"arguments\":\"\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(sse)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let backend = GrokCliBackend::new(server.uri(), "tok".to_string()).unwrap();
+        let request = ChatCompletionRequest {
+            model: "grok-4.6".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "time?".to_string(),
+            }],
+            stream: true,
+            max_tokens: None,
+            temperature: None,
+        };
+
+        let chunks: Vec<StreamChunk> = backend
+            .stream(request)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+
+        let calls: Vec<&serde_json::Value> = chunks
+            .iter()
+            .filter_map(|c| c.tool_calls.as_ref())
+            .collect();
+        assert_eq!(calls.len(), 2, "announce + arguments");
+        assert_eq!(
+            calls[0][0]["function"]["name"],
+            serde_json::json!("get_time")
+        );
+        assert_eq!(
+            calls[1][0]["function"]["arguments"],
+            serde_json::json!("{\"city\":\"SF\"}")
+        );
+        assert_eq!(
+            chunks.last().unwrap().finish_reason.as_deref(),
+            Some("tool_calls")
+        );
+    }
+}
