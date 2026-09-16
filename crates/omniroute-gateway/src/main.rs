@@ -3,7 +3,29 @@ use std::sync::Arc;
 
 use omniroute_config::GatewayConfig;
 use omniroute_db::Db;
-use omniroute_gateway::{AppState, backend::EchoBackend, build_router_with_state};
+use omniroute_gateway::{
+    AppState, backend::ChatBackend, backend::EchoBackend, build_router_with_state,
+    grok_cli::GrokCliBackend,
+};
+
+/// Select the serving backend. Defaults to the deterministic echo backend;
+/// set `GROK_CLI_TOKEN` (and optionally `GROK_CLI_BASE_URL`) to serve the
+/// real Grok Build endpoint. Connection-driven selection arrives with
+/// routing (Phase 4).
+fn select_backend() -> Result<Arc<dyn ChatBackend>, Box<dyn std::error::Error>> {
+    match std::env::var("GROK_CLI_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => {
+            let base_url = std::env::var("GROK_CLI_BASE_URL")
+                .unwrap_or_else(|_| "https://cli-chat-proxy.grok.com/v1".to_string());
+            tracing::info!("backend: grok-cli ({base_url})");
+            Ok(Arc::new(GrokCliBackend::new(base_url, token)?))
+        }
+        _ => {
+            tracing::info!("backend: echo (set GROK_CLI_TOKEN for grok-cli)");
+            Ok(Arc::new(EchoBackend))
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,8 +52,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let state = AppState::with_db(Arc::new(EchoBackend), Arc::new(db))
-        .with_require_auth(config.require_auth);
+    let backend = select_backend()?;
+    let state = AppState::with_db(backend, Arc::new(db)).with_require_auth(config.require_auth);
     let app = build_router_with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], config.port));

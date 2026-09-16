@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod backend;
+pub mod grok_cli;
 pub mod ids;
 
 use std::convert::Infallible;

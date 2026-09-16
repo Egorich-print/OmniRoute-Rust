@@ -854,14 +854,28 @@ dependencies = [
  "omniroute-config",
  "omniroute-core",
  "omniroute-db",
+ "omniroute-http",
+ "omniroute-translate",
  "omniroute-usage",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
+]
+
+[[package]]
+name = "omniroute-http"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde_json",
+ "thiserror",
+ "tokio",
  "wiremock",
 ]
 
@@ -1156,6 +1170,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -1175,12 +1190,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots",
 ]
@@ -1591,6 +1608,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-stream"
+version = "0.1.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1828,6 +1857,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81941cd78d0c92026c33e5e01312845a4cb1e9af3407f9134b100dd03144103e"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
