@@ -876,6 +876,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "omniroute-translate"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "omniroute-usage"
 version = "0.1.0"
 dependencies = [
