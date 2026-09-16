@@ -1,0 +1,276 @@
+[
+  {
+    "name": "system_user_params",
+    "input": {
+      "model": "grok-4.6",
+      "body": {
+        "model": "grok-4.6",
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are helpful."
+          },
+          {
+            "role": "user",
+            "content": "Hello"
+          }
+        ],
+        "temperature": 0.2,
+        "max_tokens": 100
+      }
+    },
+    "expected": {
+      "model": "grok-4.6",
+      "input": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Hello"
+            }
+          ],
+          "status": "completed"
+        }
+      ],
+      "stream": true,
+      "store": false,
+      "instructions": "You are helpful.",
+      "temperature": 0.2,
+      "max_output_tokens": 100
+    }
+  },
+  {
+    "name": "text_parts_tools_choice",
+    "input": {
+      "model": "grok-4.6",
+      "body": {
+        "model": "grok-4.6",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "What time is it?"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "Get time",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "function",
+          "function": {
+            "name": "get_time"
+          }
+        }
+      }
+    },
+    "expected": {
+      "model": "grok-4.6",
+      "input": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "What time is it?"
+            }
+          ],
+          "status": "completed"
+        }
+      ],
+      "stream": true,
+      "store": false,
+      "instructions": "",
+      "tools": [
+        {
+          "type": "function",
+          "name": "get_time",
+          "description": "Get time",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "tool_choice": {
+        "type": "function",
+        "name": "get_time"
+      }
+    }
+  },
+  {
+    "name": "multiturn_tools_orphan",
+    "input": {
+      "model": "grok-4.6",
+      "body": {
+        "model": "grok-4.6",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Sys."
+          },
+          {
+            "role": "user",
+            "content": "Hi"
+          },
+          {
+            "role": "assistant",
+            "content": "Hello!",
+            "tool_calls": [
+              {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": "{}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "noon"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_orphan",
+            "content": "dropped"
+          },
+          {
+            "role": "user",
+            "content": "Thanks"
+          }
+        ]
+      }
+    },
+    "expected": {
+      "model": "grok-4.6",
+      "input": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Hi"
+            }
+          ],
+          "status": "completed"
+        },
+        {
+          "type": "message",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "Hello!"
+            }
+          ],
+          "status": "completed"
+        },
+        {
+          "type": "function_call",
+          "call_id": "call_1",
+          "name": "get_time",
+          "arguments": "{}",
+          "status": "completed"
+        },
+        {
+          "type": "function_call_output",
+          "call_id": "call_1",
+          "output": "noon",
+          "status": "completed"
+        },
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Thanks"
+            }
+          ],
+          "status": "completed"
+        }
+      ],
+      "stream": true,
+      "store": false,
+      "instructions": "Sys."
+    }
+  },
+  {
+    "name": "response_format_schema",
+    "input": {
+      "model": "grok-4.6",
+      "body": {
+        "model": "grok-4.6",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Give JSON"
+          }
+        ],
+        "response_format": {
+          "type": "json_schema",
+          "json_schema": {
+            "name": "out",
+            "schema": {
+              "type": "object"
+            },
+            "strict": true
+          }
+        },
+        "top_p": 0.9,
+        "include": ["reasoning.encrypted_content"]
+      }
+    },
+    "expected": {
+      "model": "grok-4.6",
+      "input": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Give JSON"
+            }
+          ],
+          "status": "completed"
+        }
+      ],
+      "stream": true,
+      "store": false,
+      "instructions": "",
+      "top_p": 0.9,
+      "text": {
+        "format": {
+          "type": "json_schema",
+          "name": "out",
+          "schema": {
+            "type": "object"
+          },
+          "strict": true
+        }
+      },
+      "include": ["reasoning.encrypted_content"]
+    }
+  }
+]
