@@ -8,6 +8,7 @@ resolver = "3"
 members = [
     "crates/omniroute-config",
     "crates/omniroute-core",
+    "crates/omniroute-crypto",
     "crates/omniroute-db",
     "crates/omniroute-gateway",
     "crates/omniroute-http",
@@ -30,6 +31,7 @@ authors = ["OmniRoute Team"]
 [workspace.dependencies]
 omniroute-config = { path = "crates/omniroute-config" }
 omniroute-core = { path = "crates/omniroute-core" }
+omniroute-crypto = { path = "crates/omniroute-crypto" }
 omniroute-db = { path = "crates/omniroute-db" }
 omniroute-http = { path = "crates/omniroute-http" }
 omniroute-providers = { path = "crates/omniroute-providers" }
@@ -49,6 +51,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 futures = "0.3"
+aes-gcm = "0.11"
+scrypt = "0.12"
+sha2 = "0.11"
+hex = "0.4"
 insta = "1"
 wiremock = "0.6"
 reqwest = { version = "0.12", default-features = false, features = [
