@@ -46,11 +46,25 @@ impl HttpClient {
         bearer: Option<&str>,
         body: &Value,
     ) -> Result<reqwest::Response> {
-        let mut request = self.inner.post(url).json(body);
+        self.post_json_with_headers(url, bearer, &[], body).await
+    }
+
+    /// POST a JSON body with extra headers (provider session headers, etc.).
+    pub async fn post_json_with_headers(
+        &self,
+        url: &str,
+        bearer: Option<&str>,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<reqwest::Response> {
+        let mut request = self.inner.post(url);
         if let Some(token) = bearer {
             request = request.bearer_auth(token);
         }
-        let response = request.send().await?;
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = request.json(body).send().await?;
         let status = response.status();
         if !status.is_success() {
             let body = response

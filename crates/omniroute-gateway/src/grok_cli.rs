@@ -27,6 +27,47 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::backend::{ChatBackend, ChunkStream, openai_chunk_to_stream_chunk, openai_request_body};
 use crate::ids;
 
+/// Pinned Grok client version (mirrors `GROK_BUILD_DEFAULT_CLIENT_VERSION`).
+/// The proxy rejects missing/outdated versions with 426, so this must track
+/// the JS constant.
+const GROK_CLIENT_VERSION: &str = "0.2.106";
+const GROK_CLIENT_IDENTIFIER: &str = "grok-shell";
+
+fn grok_user_agent() -> String {
+    format!(
+        "{GROK_CLIENT_IDENTIFIER}/{GROK_CLIENT_VERSION} ({}; {})",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
+}
+
+/// Session headers the Grok proxy requires (mirrors
+/// `getGrokBuildSessionHeaders`). Without `x-grok-client-version` the
+/// upstream answers 426.
+fn session_headers<'a>(
+    model: &'a str,
+    stream: bool,
+    user_agent: &'a str,
+) -> Vec<(&'static str, &'a str)> {
+    vec![
+        (
+            "Accept",
+            if stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        ),
+        ("x-grok-client-version", GROK_CLIENT_VERSION),
+        ("x-grok-client-identifier", GROK_CLIENT_IDENTIFIER),
+        ("x-grok-client-mode", "headless"),
+        ("User-Agent", user_agent),
+        ("X-XAI-Token-Auth", "xai-grok-cli"),
+        ("x-authenticateresponse", "authenticate-response"),
+        ("x-grok-model-override", model),
+    ]
+}
+
 /// Grok Build executor over HTTP.
 #[derive(Debug, Clone)]
 pub struct GrokCliBackend {
@@ -61,9 +102,16 @@ impl GrokCliBackend {
 
         let mut upstream = openai_to_responses(&request.model, &openai_request_body(&request));
         upstream["stream"] = Value::from(true);
+        let user_agent = grok_user_agent();
+        let headers = session_headers(&request.model, true, &user_agent);
         let response = self
             .http
-            .post_json(&self.responses_url(), Some(&self.token), &upstream)
+            .post_json_with_headers(
+                &self.responses_url(),
+                Some(&self.token),
+                &headers,
+                &upstream,
+            )
             .await
             .map_err(|error| GatewayError::Upstream(error.to_string()))?;
 
@@ -136,9 +184,16 @@ impl ChatBackend for GrokCliBackend {
         }
         let mut upstream = openai_to_responses(&request.model, &openai_request_body(&request));
         upstream["stream"] = Value::from(false);
+        let user_agent = grok_user_agent();
+        let headers = session_headers(&request.model, false, &user_agent);
         let response = self
             .http
-            .post_json(&self.responses_url(), Some(&self.token), &upstream)
+            .post_json_with_headers(
+                &self.responses_url(),
+                Some(&self.token),
+                &headers,
+                &upstream,
+            )
             .await
             .map_err(|error| GatewayError::Upstream(error.to_string()))?;
         let payload: Value = response
@@ -239,7 +294,7 @@ mod tests {
     use serde_json::json;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{body_string_contains, method, path},
+        matchers::{body_string_contains, header, method, path},
     };
 
     fn request() -> ChatCompletionRequest {
@@ -269,6 +324,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/responses"))
             .and(body_string_contains("\"input_text\""))
+            // The proxy rejects missing/outdated client versions with 426.
+            .and(header("x-grok-client-version", "0.2.106"))
+            .and(header("x-grok-client-identifier", "grok-shell"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string(sse)
