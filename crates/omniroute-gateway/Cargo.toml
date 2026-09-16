@@ -6,7 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+omniroute-config = { workspace = true }
 omniroute-core = { workspace = true }
+omniroute-db = { workspace = true }
+omniroute-usage = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

@@ -815,6 +815,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "omniroute-config"
+version = "0.1.0"
+dependencies = [
+ "omniroute-db",
+ "rusqlite",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "omniroute-core"
 version = "0.1.0"
 dependencies = [
@@ -841,7 +851,10 @@ dependencies = [
  "axum",
  "futures",
  "http-body-util",
+ "omniroute-config",
  "omniroute-core",
+ "omniroute-db",
+ "omniroute-usage",
  "reqwest",
  "serde",
  "serde_json",
@@ -858,6 +871,17 @@ version = "0.1.0"
 dependencies = [
  "insta",
  "omniroute-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "omniroute-usage"
+version = "0.1.0"
+dependencies = [
+ "omniroute-core",
+ "omniroute-db",
+ "rusqlite",
  "serde",
  "serde_json",
 ]
