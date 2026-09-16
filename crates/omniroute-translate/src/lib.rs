@@ -5,5 +5,6 @@
 //! reasoning deltas and the terminal `response.completed` event. Tool calls,
 //! namespaces and the remaining pairs follow.
 
+pub mod claude;
 pub mod requests;
 pub mod responses;
