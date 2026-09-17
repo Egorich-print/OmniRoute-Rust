@@ -272,6 +272,7 @@ mod tests {
             top_p: None,
             tools: None,
             tool_choice: None,
+            ..Default::default()
         }
     }
 
@@ -601,6 +602,7 @@ mod provider_tests {
                 top_p: None,
                 tools: None,
                 tool_choice: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -703,6 +705,7 @@ mod tool_passthrough_tests {
                 "function": {"name": "get_time", "parameters": {"type": "object"}}
             }])),
             tool_choice: Some(serde_json::json!("auto")),
+            ..Default::default()
         };
 
         let response = backend.complete(request).await.unwrap();

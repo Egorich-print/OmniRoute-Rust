@@ -243,6 +243,7 @@ mod tests {
             top_p: None,
             tools: None,
             tool_choice: None,
+            ..Default::default()
         }
     }
 

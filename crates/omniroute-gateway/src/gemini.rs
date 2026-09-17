@@ -270,7 +270,7 @@ mod tests {
     use super::*;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{header, method, path},
+        matchers::{body_partial_json, header, method, path},
     };
 
     fn request() -> ChatCompletionRequest {
@@ -283,6 +283,7 @@ mod tests {
             top_p: None,
             tools: None,
             tool_choice: None,
+            ..Default::default()
         }
     }
 
@@ -309,6 +310,43 @@ mod tests {
         assert_eq!(response.choices[0].message.text(), "PONG");
         assert_eq!(response.choices[0].finish_reason, "stop");
         assert_eq!(response.usage.total_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn forwards_json_response_format_to_generation_config() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3.8-flash:generateContent"))
+            .and(body_partial_json(json!({
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "responseSchema": {"type": "object"}
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candidates": [{
+                    "content": {"parts": [{"text": "{}"}]},
+                    "finishReason": "STOP"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend =
+            GeminiBackend::new(format!("{}/models", server.uri()), vec!["k1".to_string()]).unwrap();
+        let mut request = request();
+        request.response_format = Some(json!({
+            "type": "json_schema",
+            "json_schema": {"schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "additionalProperties": false
+            }}
+        }));
+
+        let response = backend.complete(request).await.unwrap();
+        assert_eq!(response.choices[0].message.text(), "{}");
     }
 
     #[tokio::test]

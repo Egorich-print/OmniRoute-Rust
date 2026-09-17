@@ -62,6 +62,15 @@ pub(crate) fn openai_request_body(request: &ChatCompletionRequest) -> Value {
     if let Some(tool_choice) = &request.tool_choice {
         body["tool_choice"] = tool_choice.clone();
     }
+    if let Some(response_format) = &request.response_format {
+        body["response_format"] = response_format.clone();
+    }
+    if let Some(stop) = &request.stop {
+        body["stop"] = stop.clone();
+    }
+    if let Some(top_k) = request.top_k {
+        body["top_k"] = json!(top_k);
+    }
     body
 }
 
@@ -239,6 +248,7 @@ mod tests {
             top_p: None,
             tools: None,
             tool_choice: None,
+            ..Default::default()
         }
     }
 

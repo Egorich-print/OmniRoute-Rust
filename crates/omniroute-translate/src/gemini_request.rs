@@ -136,6 +136,29 @@ pub fn openai_to_gemini(body: &Value) -> Value {
     {
         config.insert("maxOutputTokens".to_string(), json!(max_tokens));
     }
+    if let Some(format) = body.get("response_format").and_then(Value::as_object) {
+        match format.get("type").and_then(Value::as_str) {
+            Some("json_object") => {
+                config.insert(
+                    "responseMimeType".to_string(),
+                    Value::from("application/json"),
+                );
+            }
+            Some("json_schema") => {
+                config.insert(
+                    "responseMimeType".to_string(),
+                    Value::from("application/json"),
+                );
+                if let Some(schema) = format
+                    .get("json_schema")
+                    .and_then(|entry| entry.get("schema"))
+                {
+                    config.insert("responseSchema".to_string(), gemini_schema(schema));
+                }
+            }
+            _ => {}
+        }
+    }
     if !config.is_empty() {
         result.insert("generationConfig".to_string(), Value::Object(config));
     }
@@ -155,7 +178,7 @@ pub fn openai_to_gemini(body: &Value) -> Value {
                     declaration.insert("description".to_string(), Value::from(description));
                 }
                 if let Some(parameters) = function.get("parameters") {
-                    declaration.insert("parameters".to_string(), parameters.clone());
+                    declaration.insert("parameters".to_string(), gemini_schema(parameters));
                 }
                 Some(Value::Object(declaration))
             })
@@ -193,6 +216,120 @@ pub fn openai_to_gemini(body: &Value) -> Value {
         }
     }
 
+    Value::Object(result)
+}
+
+/// Types Gemini's `Schema.Type` enum models.
+const GEMINI_TYPES: [&str; 6] = ["string", "number", "integer", "boolean", "array", "object"];
+
+/// Reduce a JSON Schema to the subset Gemini's `Schema` message accepts.
+///
+/// Clients hand over full draft schemas (`$schema`, `additionalProperties`,
+/// `exclusiveMinimum`, …) because OpenAI tolerates them. Gemini answers
+/// unknown keywords with a hard 400, so parameters are rebuilt from the
+/// keywords it does model.
+fn gemini_schema(schema: &Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return json!({});
+    };
+
+    let mut result = Map::new();
+    let mut nullable = object
+        .get("nullable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    match object.get("type") {
+        Some(Value::String(kind)) => {
+            if kind == "null" {
+                nullable = true;
+            } else if GEMINI_TYPES.contains(&kind.as_str()) {
+                result.insert("type".to_string(), Value::from(kind.as_str()));
+            }
+        }
+        Some(Value::Array(kinds)) => {
+            for kind in kinds.iter().filter_map(Value::as_str) {
+                if kind == "null" {
+                    nullable = true;
+                } else if !result.contains_key("type") && GEMINI_TYPES.contains(&kind) {
+                    result.insert("type".to_string(), Value::from(kind));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    for key in ["title", "description", "format", "pattern"] {
+        if let Some(value) = object.get(key).filter(|value| value.is_string()) {
+            result.insert(key.to_string(), value.clone());
+        }
+    }
+    for key in [
+        "minimum",
+        "maximum",
+        "minItems",
+        "maxItems",
+        "minLength",
+        "maxLength",
+        "minProperties",
+        "maxProperties",
+    ] {
+        if let Some(value) = object.get(key).filter(|value| value.is_number()) {
+            result.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(value) = object.get("default") {
+        result.insert("default".to_string(), value.clone());
+    }
+    if let Some(Value::Array(values)) = object.get("enum") {
+        result.insert("enum".to_string(), Value::Array(values.clone()));
+    }
+    if let Some(Value::Array(values)) = object.get("required") {
+        let names: Vec<Value> = values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(Value::from)
+            .collect();
+        if !names.is_empty() {
+            result.insert("required".to_string(), Value::Array(names));
+        }
+    }
+    if let Some(Value::Object(properties)) = object.get("properties") {
+        let mapped: Map<String, Value> = properties
+            .iter()
+            .map(|(name, property)| (name.clone(), gemini_schema(property)))
+            .collect();
+        if !mapped.is_empty() {
+            result.insert("properties".to_string(), Value::Object(mapped));
+        }
+    }
+    if let Some(items) = object.get("items").filter(|items| items.is_object()) {
+        result.insert("items".to_string(), gemini_schema(items));
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(Value::Array(branches)) = object.get(key)
+            && !result.contains_key("anyOf")
+        {
+            let branches: Vec<Value> = branches.iter().map(gemini_schema).collect();
+            if !branches.is_empty() {
+                result.insert("anyOf".to_string(), Value::Array(branches));
+            }
+        }
+    }
+    if let Some(Value::Array(order)) = object.get("propertyOrdering") {
+        result.insert("propertyOrdering".to_string(), Value::Array(order.clone()));
+    }
+
+    if nullable {
+        result.insert("nullable".to_string(), Value::Bool(true));
+    }
+    if !result.contains_key("type") {
+        if result.contains_key("properties") {
+            result.insert("type".to_string(), Value::from("object"));
+        } else if result.contains_key("items") {
+            result.insert("type".to_string(), Value::from("array"));
+        }
+    }
     Value::Object(result)
 }
 
@@ -256,6 +393,136 @@ mod tests {
         assert_eq!(out["contents"][0]["parts"][0]["text"], json!("Hi"));
         assert_eq!(out["generationConfig"]["temperature"], json!(0.2));
         assert_eq!(out["generationConfig"]["maxOutputTokens"], json!(100));
+    }
+
+    #[test]
+    fn maps_response_format_to_json_mode() {
+        let plain = openai_to_gemini(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"}
+        }));
+        assert_eq!(
+            plain["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert!(plain["generationConfig"].get("responseSchema").is_none());
+
+        let structured = openai_to_gemini(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"]
+                    }
+                }
+            }
+        }));
+        let config = &structured["generationConfig"];
+        assert_eq!(config["responseMimeType"], "application/json");
+        assert_eq!(config["responseSchema"]["type"], "object");
+        assert_eq!(
+            config["responseSchema"]["properties"]["answer"]["type"],
+            "string"
+        );
+        assert!(!config["responseSchema"].to_string().contains("$schema"));
+
+        let text = openai_to_gemini(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "text"}
+        }));
+        assert!(text.get("generationConfig").is_none());
+    }
+
+    #[test]
+    fn strips_schema_keywords_gemini_rejects() {
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "description": "Run a command",
+                    "parameters": {
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "command": {"type": "string", "description": "Command to run"},
+                            "timeout": {
+                                "type": ["integer", "null"],
+                                "exclusiveMinimum": 0,
+                                "minimum": 1
+                            },
+                            "options": {
+                                "type": "object",
+                                "additionalProperties": {"type": "string"},
+                                "properties": {
+                                    "cwd": {
+                                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                                        "$schema": "http://json-schema.org/draft-07/schema#"
+                                    }
+                                }
+                            },
+                            "tags": {"type": "array", "items": {"type": "string"}}
+                        },
+                        "required": ["command", "timeout"],
+                        "definitions": {"unused": {"type": "string"}}
+                    }
+                }
+            }]
+        });
+
+        let converted = openai_to_gemini(&body);
+        let parameters = &converted["tools"][0]["functionDeclarations"][0]["parameters"];
+
+        let encoded = parameters.to_string();
+        for rejected in [
+            "$schema",
+            "additionalProperties",
+            "exclusiveMinimum",
+            "definitions",
+        ] {
+            assert!(!encoded.contains(rejected), "leaked {rejected}: {encoded}");
+        }
+
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(parameters["required"], json!(["command", "timeout"]));
+        assert_eq!(parameters["properties"]["command"]["type"], "string");
+        assert_eq!(
+            parameters["properties"]["command"]["description"],
+            "Command to run"
+        );
+        assert_eq!(parameters["properties"]["timeout"]["type"], "integer");
+        assert_eq!(parameters["properties"]["timeout"]["nullable"], true);
+        assert_eq!(parameters["properties"]["timeout"]["minimum"], 1);
+        assert_eq!(parameters["properties"]["tags"]["type"], "array");
+        assert_eq!(parameters["properties"]["tags"]["items"]["type"], "string");
+        assert_eq!(parameters["properties"]["options"]["type"], "object");
+        assert_eq!(
+            parameters["properties"]["options"]["properties"]["cwd"]["anyOf"][0]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn rejects_tool_without_name_and_keeps_the_rest() {
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "function": {"parameters": {"type": "object"}}},
+                {"type": "function", "function": {"name": "ok", "parameters": {"type": "object"}}}
+            ]
+        });
+
+        let declarations = openai_to_gemini(&body)["tools"][0]["functionDeclarations"].clone();
+        assert_eq!(declarations.as_array().unwrap().len(), 1);
+        assert_eq!(declarations[0]["name"], "ok");
     }
 
     #[test]

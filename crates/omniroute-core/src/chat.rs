@@ -76,7 +76,7 @@ impl ChatMessage {
 ///
 /// Unknown fields are ignored so clients can send the full OpenAI payload
 /// while the router only consumes what it currently understands.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -92,6 +92,13 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Value>,
     #[serde(default)]
     pub tool_choice: Option<Value>,
+    /// JSON-response request; translated for providers that have a native mode.
+    #[serde(default)]
+    pub response_format: Option<Value>,
+    #[serde(default)]
+    pub stop: Option<Value>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
 }
 
 /// One completion choice in a non-streaming response.

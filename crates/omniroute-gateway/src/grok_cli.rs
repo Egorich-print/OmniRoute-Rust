@@ -392,6 +392,7 @@ mod tests {
             top_p: None,
             tools: None,
             tool_choice: None,
+            ..Default::default()
         }
     }
 
@@ -558,6 +559,7 @@ mod tool_tests {
             top_p: None,
             tools: None,
             tool_choice: None,
+            ..Default::default()
         };
 
         let chunks: Vec<StreamChunk> = backend
@@ -638,6 +640,7 @@ mod rotation_tests {
             top_p: None,
             tools: None,
             tool_choice: None,
+            ..Default::default()
         };
         let response = backend.complete(request).await.unwrap();
         assert_eq!(response.choices[0].message.text(), "rotated");
@@ -687,6 +690,7 @@ mod tool_completion_tests {
                 "function": {"name": "get_time", "parameters": {"type": "object"}}
             }])),
             tool_choice: None,
+            ..Default::default()
         };
         let response = backend.complete(request).await.unwrap();
         assert_eq!(response.choices[0].finish_reason, "tool_calls");
