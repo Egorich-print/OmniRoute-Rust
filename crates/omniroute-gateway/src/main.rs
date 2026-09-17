@@ -45,10 +45,12 @@ fn grok_tokens(db: &Db, data_dir: &std::path::Path) -> Vec<String> {
 /// model: combo names expand from the database, `grok-*` prefers grok-cli,
 /// everything else prefers an explicit OpenAI-compatible endpoint, and echo
 /// is the ultimate fallback.
+type Selected = (Arc<dyn ChatBackend>, Arc<ProviderRegistry>, Vec<String>);
+
 fn select_backend(
     db: Arc<Db>,
     data_dir: &std::path::Path,
-) -> Result<Arc<dyn ChatBackend>, Box<dyn std::error::Error>> {
+) -> Result<Selected, Box<dyn std::error::Error>> {
     let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
     backends.insert("echo".to_string(), Arc::new(EchoBackend));
 
@@ -131,9 +133,10 @@ fn select_backend(
 
     tracing::info!("backend available: echo (fallback)");
     let registry = Arc::new(ProviderRegistry::load());
-    Ok(Arc::new(
-        RoutingBackend::new(backends, Router::new(rules, default)).with_combo_source(db, registry),
-    ))
+    let names: Vec<String> = backends.keys().cloned().collect();
+    let routing = RoutingBackend::new(backends, Router::new(rules, default))
+        .with_combo_source(db, registry.clone());
+    Ok((Arc::new(routing), registry, names))
 }
 
 #[tokio::main]
@@ -162,8 +165,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let db = Arc::new(db);
-    let backend = select_backend(db.clone(), &config.data_dir)?;
-    let state = AppState::with_db(backend, db).with_require_auth(config.require_auth);
+    let (backend, registry, backend_names) = select_backend(db.clone(), &config.data_dir)?;
+    let state = AppState::with_db(backend, db)
+        .with_require_auth(config.require_auth)
+        .with_catalog(registry, backend_names);
     let app = build_router_with_state(state);
 
     let ip: std::net::IpAddr = config.host.parse()?;

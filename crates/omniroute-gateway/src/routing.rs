@@ -176,13 +176,13 @@ mod tests {
     fn request(model: &str) -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: model.to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-            }],
+            messages: vec![ChatMessage::plain("user".to_string(), "hi".to_string())],
             stream: false,
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
         }
     }
 
@@ -204,7 +204,7 @@ mod tests {
     async fn falls_back_on_primary_failure() {
         let routing = routing();
         let response = routing.complete(request("x-model")).await.unwrap();
-        assert_eq!(response.choices[0].message.content, "echo: hi");
+        assert_eq!(response.choices[0].message.text(), "echo: hi");
     }
 
     #[tokio::test]
@@ -214,7 +214,7 @@ mod tests {
         routing.complete(request("x-model")).await.unwrap();
         // Second call must not touch "fail" at all (breaker open, long cooldown).
         let response = routing.complete(request("x-model")).await.unwrap();
-        assert_eq!(response.choices[0].message.content, "echo: hi");
+        assert_eq!(response.choices[0].message.text(), "echo: hi");
     }
 
     #[tokio::test]
@@ -277,6 +277,6 @@ mod tests {
 
         let response = routing.complete(request("test-combo")).await.unwrap();
         assert_eq!(response.model, "grok-4.6");
-        assert_eq!(response.choices[0].message.content, "echo: hi");
+        assert_eq!(response.choices[0].message.text(), "echo: hi");
     }
 }

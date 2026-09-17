@@ -38,14 +38,11 @@ pub trait ChatBackend: Send + Sync + 'static {
 /// Shared by executors that speak OpenAI Chat Completions natively or via a
 /// translator that consumes the same shape.
 pub(crate) fn openai_request_body(request: &ChatCompletionRequest) -> Value {
-    let messages: Vec<Value> = request
-        .messages
-        .iter()
-        .map(|message| json!({"role": message.role, "content": message.content}))
-        .collect();
+    // Messages are forwarded verbatim (typed as JSON) so agent turns keep
+    // their `tool_calls` / `tool_call_id` / null content intact.
     let mut body = json!({
         "model": request.model,
-        "messages": messages,
+        "messages": request.messages,
         "stream": request.stream,
     });
     if let Some(max_tokens) = request.max_tokens {
@@ -53,6 +50,17 @@ pub(crate) fn openai_request_body(request: &ChatCompletionRequest) -> Value {
     }
     if let Some(temperature) = request.temperature {
         body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = request.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    // Tool definitions must reach the upstream, or the model invents an XML
+    // pseudo-call instead of a real `tool_calls` response.
+    if let Some(tools) = &request.tools {
+        body["tools"] = tools.clone();
+    }
+    if let Some(tool_choice) = &request.tool_choice {
+        body["tool_choice"] = tool_choice.clone();
     }
     body
 }
@@ -108,7 +116,7 @@ impl EchoBackend {
             .iter()
             .rev()
             .find(|m| m.role == "user")
-            .map(|m| m.content.clone())
+            .map(|m| m.text())
             .unwrap_or_default();
         format!("echo: {last_user}")
     }
@@ -132,7 +140,7 @@ impl ChatBackend for EchoBackend {
         let prompt_tokens = request
             .messages
             .iter()
-            .map(|m| m.content.len())
+            .map(|m| m.text().len())
             .sum::<usize>() as u32;
         let completion_tokens = reply.len() as u32;
 
@@ -143,10 +151,7 @@ impl ChatBackend for EchoBackend {
             model: request.model,
             choices: vec![ChatChoice {
                 index: 0,
-                message: ChatMessage {
-                    role: "assistant".into(),
-                    content: reply,
-                },
+                message: ChatMessage::assistant_text(reply),
                 finish_reason: "stop".into(),
             }],
             usage: Usage {
@@ -227,13 +232,23 @@ mod tests {
     fn request(text: &str) -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: "test-model".into(),
-            messages: vec![ChatMessage {
-                role: "user".into(),
-                content: text.into(),
-            }],
+            messages: vec![user_message(text)],
             stream: false,
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+        }
+    }
+
+    fn user_message(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: "user".into(),
+            content: Some(serde_json::Value::from(text)),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
         }
     }
 
@@ -241,7 +256,7 @@ mod tests {
     async fn complete_echoes_last_user_message() {
         let backend = EchoBackend;
         let response = backend.complete(request("hello")).await.unwrap();
-        assert_eq!(response.choices[0].message.content, "echo: hello");
+        assert_eq!(response.choices[0].message.text(), "echo: hello");
         assert_eq!(response.choices[0].finish_reason, "stop");
     }
 

@@ -182,12 +182,32 @@ fn openai_payload_to_completion(model: &str, payload: &Value) -> ChatCompletionR
         .to_string();
     let choice = payload.get("choices").and_then(|choices| choices.get(0));
     let message = choice.and_then(|choice| choice.get("message"));
-    let content = message.map(message_text).unwrap_or_default();
+    // Preserve the upstream assistant turn verbatim: tool_calls, null
+    // content and the real finish_reason must survive, or agents never see
+    // their function calls.
+    let content = message
+        .and_then(|message| message.get("content"))
+        .cloned()
+        .or_else(|| {
+            message
+                .map(message_text)
+                .filter(|text| !text.is_empty())
+                .map(Value::from)
+        });
+    let tool_calls = message
+        .and_then(|message| message.get("tool_calls"))
+        .cloned();
     let finish = choice
         .and_then(|choice| choice.get("finish_reason"))
         .and_then(Value::as_str)
-        .unwrap_or("stop")
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if tool_calls.is_some() {
+                "tool_calls".to_string()
+            } else {
+                "stop".to_string()
+            }
+        });
     let usage = payload.get("usage");
     let prompt = usage
         .and_then(|usage| usage.get("prompt_tokens"))
@@ -213,6 +233,9 @@ fn openai_payload_to_completion(model: &str, payload: &Value) -> ChatCompletionR
             message: ChatMessage {
                 role: "assistant".to_string(),
                 content,
+                tool_calls,
+                tool_call_id: None,
+                name: None,
             },
             finish_reason: finish,
         }],
@@ -238,13 +261,13 @@ mod tests {
     fn request() -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: "test-model".to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: "Hi".to_string(),
-            }],
+            messages: vec![ChatMessage::plain("user".to_string(), "Hi".to_string())],
             stream: true,
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
         }
     }
 
@@ -313,7 +336,7 @@ mod tests {
         req.stream = false;
         let response = backend.complete(req).await.unwrap();
 
-        assert_eq!(response.choices[0].message.content, "Hi there");
+        assert_eq!(response.choices[0].message.text(), "Hi there");
         assert_eq!(response.usage.total_tokens, 5);
     }
 
@@ -567,16 +590,116 @@ mod provider_tests {
         let response = backend
             .complete(ChatCompletionRequest {
                 model: "some/model:free".to_string(),
-                messages: vec![ChatMessage {
-                    role: "user".to_string(),
-                    content: "hi".to_string(),
-                }],
+                messages: vec![ChatMessage::plain("user".to_string(), "hi".to_string())],
                 stream: false,
                 max_tokens: None,
                 temperature: None,
+                top_p: None,
+                tools: None,
+                tool_choice: None,
             })
             .await
             .unwrap();
-        assert_eq!(response.choices[0].message.content, "hi");
+        assert_eq!(response.choices[0].message.text(), "hi");
+    }
+}
+
+#[cfg(test)]
+mod tool_passthrough_tests {
+    use super::*;
+    use omniroute_core::{ChatCompletionRequest, ChatMessage};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_string_contains, method, path},
+    };
+
+    #[test]
+    fn completion_preserves_tool_calls_and_finish_reason() {
+        let payload = serde_json::json!({
+            "id": "c1",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_time", "arguments": "{\"city\":\"SF\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let response = openai_payload_to_completion("m", &payload);
+        assert_eq!(response.choices[0].finish_reason, "tool_calls");
+        let message = &response.choices[0].message;
+        assert!(message.has_tool_calls());
+        assert_eq!(message.text(), "");
+    }
+
+    #[tokio::test]
+    async fn tool_definitions_reach_the_upstream() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("\"get_time\""))
+            .and(body_string_contains("\"tool_calls\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "c1",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = ProviderOpenAiBackend::new(
+            "test".to_string(),
+            resolve_chat_url(&format!("{}/v1", server.uri())),
+            vec!["k".to_string()],
+        )
+        .unwrap();
+
+        let request = ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![
+                ChatMessage::plain("user", "time?"),
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: Some(serde_json::json!([{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_time", "arguments": "{}"}
+                    }])),
+                    tool_call_id: None,
+                    name: None,
+                },
+                ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(serde_json::Value::from("12:00")),
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                    name: None,
+                },
+            ],
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: Some(serde_json::json!([{
+                "type": "function",
+                "function": {"name": "get_time", "parameters": {"type": "object"}}
+            }])),
+            tool_choice: Some(serde_json::json!("auto")),
+        };
+
+        let response = backend.complete(request).await.unwrap();
+        assert_eq!(response.choices[0].message.text(), "ok");
     }
 }

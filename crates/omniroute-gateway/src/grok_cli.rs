@@ -20,7 +20,7 @@ use omniroute_translate::{
     requests::openai_to_responses,
     responses::{Converted, ResponsesState, convert_event},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -281,19 +281,45 @@ fn response_to_completion(model: &str, payload: &Value) -> ChatCompletionRespons
         .to_string();
 
     let mut text = String::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
     if let Some(output) = payload.get("output").and_then(Value::as_array) {
         for item in output {
-            if item.get("type").and_then(Value::as_str) != Some("message") {
-                continue;
-            }
-            if let Some(content) = item.get("content").and_then(Value::as_array) {
-                for part in content {
-                    if part.get("type").and_then(Value::as_str) == Some("output_text")
-                        && let Some(part_text) = part.get("text").and_then(Value::as_str)
-                    {
-                        text.push_str(part_text);
+            match item.get("type").and_then(Value::as_str) {
+                Some("message") => {
+                    if let Some(content) = item.get("content").and_then(Value::as_array) {
+                        for part in content {
+                            if part.get("type").and_then(Value::as_str) == Some("output_text")
+                                && let Some(part_text) = part.get("text").and_then(Value::as_str)
+                            {
+                                text.push_str(part_text);
+                            }
+                        }
                     }
                 }
+                // A Responses `function_call` item maps to an OpenAI tool call.
+                Some("function_call") => {
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("id").and_then(Value::as_str))
+                        .unwrap_or("");
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                    if name.is_empty() {
+                        continue;
+                    }
+                    tool_calls.push(json!({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": item
+                                .get("arguments")
+                                .and_then(Value::as_str)
+                                .unwrap_or("{}"),
+                        },
+                    }));
+                }
+                _ => {}
             }
         }
     }
@@ -313,6 +339,19 @@ fn response_to_completion(model: &str, payload: &Value) -> ChatCompletionRespons
         .map(|total| total as u32)
         .unwrap_or_else(|| prompt + completion);
 
+    let has_calls = !tool_calls.is_empty();
+    let message = ChatMessage {
+        role: "assistant".to_string(),
+        content: if text.is_empty() {
+            None
+        } else {
+            Some(Value::from(text))
+        },
+        tool_calls: has_calls.then_some(Value::Array(tool_calls)),
+        tool_call_id: None,
+        name: None,
+    };
+
     ChatCompletionResponse {
         id: format!("chatcmpl-{id}"),
         object: "chat.completion",
@@ -320,11 +359,8 @@ fn response_to_completion(model: &str, payload: &Value) -> ChatCompletionRespons
         model: model.to_string(),
         choices: vec![ChatChoice {
             index: 0,
-            message: ChatMessage {
-                role: "assistant".to_string(),
-                content: text,
-            },
-            finish_reason: "stop".to_string(),
+            message,
+            finish_reason: if has_calls { "tool_calls" } else { "stop" }.to_string(),
         }],
         usage: Usage {
             prompt_tokens: prompt,
@@ -348,13 +384,13 @@ mod tests {
     fn request() -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: "grok-4.6".to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: "Hi".to_string(),
-            }],
+            messages: vec![ChatMessage::plain("user".to_string(), "Hi".to_string())],
             stream: true,
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
         }
     }
 
@@ -426,7 +462,7 @@ mod tests {
         req.stream = false;
         let response = backend.complete(req).await.unwrap();
 
-        assert_eq!(response.choices[0].message.content, "Hi there");
+        assert_eq!(response.choices[0].message.text(), "Hi there");
         assert_eq!(response.usage.prompt_tokens, 4);
         assert_eq!(response.usage.total_tokens, 6);
         assert_eq!(response.choices[0].finish_reason, "stop");
@@ -514,13 +550,13 @@ mod tool_tests {
         let backend = GrokCliBackend::new(server.uri(), "tok".to_string()).unwrap();
         let request = ChatCompletionRequest {
             model: "grok-4.6".to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: "time?".to_string(),
-            }],
+            messages: vec![ChatMessage::plain("user".to_string(), "time?".to_string())],
             stream: true,
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
         };
 
         let chunks: Vec<StreamChunk> = backend
@@ -594,20 +630,70 @@ mod rotation_tests {
 
         let request = ChatCompletionRequest {
             model: "grok-4.6".to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-            }],
+            messages: vec![ChatMessage::plain("user".to_string(), "hi".to_string())],
             stream: false,
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
         };
         let response = backend.complete(request).await.unwrap();
-        assert_eq!(response.choices[0].message.content, "rotated");
+        assert_eq!(response.choices[0].message.text(), "rotated");
     }
 
     #[test]
     fn empty_pool_is_rejected() {
         assert!(GrokCliBackend::with_tokens("http://x".to_string(), vec![]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tool_completion_tests {
+    use super::*;
+    use omniroute_core::{ChatCompletionRequest, ChatMessage};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    #[tokio::test]
+    async fn nonstream_function_call_becomes_tool_calls() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_1",
+                "output": [
+                    {"type": "function_call", "call_id": "call_1", "name": "get_time",
+                     "arguments": "{\"city\":\"SF\"}"}
+                ],
+                "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = GrokCliBackend::new(server.uri(), "tok".to_string()).unwrap();
+        let request = ChatCompletionRequest {
+            model: "grok-4.6".to_string(),
+            messages: vec![ChatMessage::plain("user", "time?")],
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: Some(serde_json::json!([{
+                "type": "function",
+                "function": {"name": "get_time", "parameters": {"type": "object"}}
+            }])),
+            tool_choice: None,
+        };
+        let response = backend.complete(request).await.unwrap();
+        assert_eq!(response.choices[0].finish_reason, "tool_calls");
+        let calls = response.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(calls[0]["function"]["name"], serde_json::json!("get_time"));
+        assert_eq!(
+            calls[0]["function"]["arguments"],
+            serde_json::json!("{\"city\":\"SF\"}")
+        );
     }
 }

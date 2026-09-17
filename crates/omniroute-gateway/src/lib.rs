@@ -31,6 +31,7 @@ use axum::{
 use futures::StreamExt;
 use omniroute_core::{ChatCompletionRequest, GatewayError, StreamChunk};
 use omniroute_db::Db;
+use omniroute_providers::ProviderRegistry;
 use omniroute_usage::{PriceTable, UsageRecord, record_usage};
 use serde_json::{Value, json};
 
@@ -43,6 +44,8 @@ pub struct AppState {
     pub(crate) db: Option<Arc<Db>>,
     pub(crate) require_auth: bool,
     pub(crate) prices: PriceTable,
+    pub(crate) registry: Option<Arc<ProviderRegistry>>,
+    pub(crate) backend_names: Vec<String>,
 }
 
 impl AppState {
@@ -53,6 +56,8 @@ impl AppState {
             db: None,
             require_auth: false,
             prices: PriceTable::with_defaults(),
+            registry: None,
+            backend_names: Vec::new(),
         }
     }
 
@@ -63,7 +68,21 @@ impl AppState {
             db: Some(db),
             require_auth: false,
             prices: PriceTable::with_defaults(),
+            registry: None,
+            backend_names: Vec::new(),
         }
+    }
+
+    /// Attach the provider registry and the backend names left after
+    /// selector rules were applied (`echo` counts as a backend).
+    pub fn with_catalog(
+        mut self,
+        registry: Arc<ProviderRegistry>,
+        backend_names: Vec<String>,
+    ) -> Self {
+        self.registry = Some(registry);
+        self.backend_names = backend_names;
+        self
     }
 
     /// Force API-key auth even when the `api_keys` table is empty.
@@ -92,15 +111,42 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({ "status": "ok", "backend": state.backend.name() }))
 }
 
-async fn list_models(_auth: Authenticated) -> impl IntoResponse {
-    Json(json!({
-        "object": "list",
-        "data": [
-            { "id": "grok-4.6", "object": "model", "owned_by": "omniroute" },
-            { "id": "grok-4.5", "object": "model", "owned_by": "omniroute" },
-            { "id": "grok-composer-2.5-fast", "object": "model", "owned_by": "omniroute" }
-        ]
-    }))
+async fn list_models(State(state): State<AppState>, _auth: Authenticated) -> impl IntoResponse {
+    let mut data: Vec<Value> = Vec::new();
+
+    // Combo names are first-class models for clients.
+    if let Some(db) = state.db.as_ref() {
+        let guard = db.connection();
+        if let Ok(combos) = omniroute_db::repos::list_combos(&guard) {
+            for combo in combos {
+                data.push(json!({
+                    "id": combo.name,
+                    "object": "model",
+                    "owned_by": "omniroute",
+                    "omniroute": { "kind": "combo" },
+                }));
+            }
+        }
+    }
+
+    // `provider/model` ids for every provider that has a live backend.
+    if let Some(registry) = state.registry.as_ref() {
+        for entry in registry.iter() {
+            if !state.backend_names.iter().any(|name| name == &entry.id) {
+                continue;
+            }
+            for model in &entry.models {
+                data.push(json!({
+                    "id": format!("{}/{}", entry.id, model.id),
+                    "object": "model",
+                    "owned_by": entry.id,
+                    "omniroute": { "kind": "provider", "provider": entry.id },
+                }));
+            }
+        }
+    }
+
+    Json(json!({ "object": "list", "data": data }))
 }
 async fn chat_completions(
     State(state): State<AppState>,
