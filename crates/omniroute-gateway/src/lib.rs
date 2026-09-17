@@ -5,6 +5,7 @@
 //! Completions shape, so an `openai-responses` upstream just needs a
 //! translation layer in front of [`backend::ChatBackend`] later.
 
+pub mod admin;
 pub mod auth;
 pub mod backend;
 pub mod combos;
@@ -15,6 +16,7 @@ pub mod ids;
 pub mod openai;
 pub mod responses;
 pub mod routing;
+pub mod ui;
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -48,6 +50,8 @@ pub struct AppState {
     pub(crate) prices: PriceTable,
     pub(crate) registry: Option<Arc<ProviderRegistry>>,
     pub(crate) backend_names: Vec<String>,
+    /// Built dashboard bundle, when one is present.
+    pub(crate) ui_dir: Option<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -60,6 +64,7 @@ impl AppState {
             prices: PriceTable::with_defaults(),
             registry: None,
             backend_names: Vec::new(),
+            ui_dir: None,
         }
     }
 
@@ -72,6 +77,7 @@ impl AppState {
             prices: PriceTable::with_defaults(),
             registry: None,
             backend_names: Vec::new(),
+            ui_dir: None,
         }
     }
 
@@ -84,6 +90,12 @@ impl AppState {
     ) -> Self {
         self.registry = Some(registry);
         self.backend_names = backend_names;
+        self
+    }
+
+    /// Serve the dashboard bundle from `dir`.
+    pub fn with_ui_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.ui_dir = dir;
         self
     }
 
@@ -104,6 +116,13 @@ pub fn build_router(backend: Arc<dyn ChatBackend>) -> Router {
 pub fn build_router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/api/overview", get(admin::overview))
+        .route("/api/combos", get(admin::combos))
+        .route("/api/connections", get(admin::connections))
+        .route("/api/usage", get(admin::usage))
+        .route("/api/logs", get(admin::logs))
+        .route("/", get(ui::serve))
+        .route("/{*path}", get(ui::serve))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)

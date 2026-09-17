@@ -280,6 +280,180 @@ pub fn kv_delete(conn: &Connection, namespace: &str, key: &str) -> Result<()> {
     Ok(())
 }
 
+/// A `provider_connections` row shaped for the admin UI (no secrets).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConnectionSummary {
+    pub id: String,
+    pub provider: String,
+    pub name: Option<String>,
+    pub auth_type: Option<String>,
+    pub is_active: bool,
+    pub priority: i64,
+    pub expires_at: Option<String>,
+    pub test_status: Option<String>,
+    pub last_error: Option<String>,
+    /// Whether the row carries a usable secret (never the secret itself).
+    pub has_credential: bool,
+}
+
+/// List every connection, active first, for the admin UI.
+pub fn list_connections(conn: &Connection) -> Result<Vec<ConnectionSummary>> {
+    let mut statement = conn.prepare(
+        "SELECT id, provider, name, auth_type, is_active, priority, expires_at, \
+                test_status, last_error, access_token, api_key \
+         FROM provider_connections ORDER BY is_active DESC, provider ASC, priority DESC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        let access_token: Option<String> = row.get("access_token")?;
+        let api_key: Option<String> = row.get("api_key")?;
+        let has_credential = [access_token, api_key]
+            .iter()
+            .flatten()
+            .any(|secret| !secret.is_empty());
+        Ok(ConnectionSummary {
+            id: row.get("id")?,
+            provider: row.get("provider")?,
+            name: row.get("name")?,
+            auth_type: row.get("auth_type")?,
+            is_active: row.get::<_, Option<i64>>("is_active")?.unwrap_or(0) != 0,
+            priority: row.get::<_, Option<i64>>("priority")?.unwrap_or(0),
+            expires_at: row.get("expires_at")?,
+            test_status: row.get("test_status")?,
+            last_error: row.get("last_error")?,
+            has_credential,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(crate::error::DbError::from)
+}
+
+/// One `(key, requests, tokens_in, tokens_out)` aggregate row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageBucket {
+    pub key: String,
+    pub requests: i64,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+}
+
+/// Aggregate usage since `since` (compared as text, the stored format).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UsageSummary {
+    pub requests: i64,
+    pub successes: i64,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+    pub tokens_cache_read: i64,
+    pub by_provider: Vec<UsageBucket>,
+    pub by_model: Vec<UsageBucket>,
+}
+
+/// Summarise `usage_history` for the dashboard.
+///
+/// `since` is a SQLite datetime modifier (e.g. `-7 days`), evaluated by
+/// SQLite itself so both timestamp spellings in the table are handled the
+/// same way the Node server handled them.
+pub fn usage_summary(conn: &Connection, since: &str, top: usize) -> Result<UsageSummary> {
+    let mut summary = UsageSummary::default();
+
+    let totals = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(success), 0), \
+                COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0), \
+                COALESCE(SUM(tokens_cache_read), 0) \
+         FROM usage_history WHERE timestamp >= datetime('now', ?1)",
+        params![since],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        },
+    )?;
+    summary.requests = totals.0;
+    summary.successes = totals.1;
+    summary.tokens_input = totals.2;
+    summary.tokens_output = totals.3;
+    summary.tokens_cache_read = totals.4;
+
+    summary.by_provider = buckets(conn, "provider", since, top)?;
+    summary.by_model = buckets(conn, "model", since, top)?;
+    Ok(summary)
+}
+
+fn buckets(conn: &Connection, column: &str, since: &str, top: usize) -> Result<Vec<UsageBucket>> {
+    // `column` is a fixed identifier chosen by the caller, never user input.
+    let sql = format!(
+        "SELECT COALESCE({column}, 'unknown') AS key, COUNT(*), \
+                COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0) \
+         FROM usage_history WHERE timestamp >= datetime('now', ?1) \
+         GROUP BY key ORDER BY COUNT(*) DESC LIMIT ?2"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params![since, top as i64], |row| {
+        Ok(UsageBucket {
+            key: row.get(0)?,
+            requests: row.get(1)?,
+            tokens_input: row.get(2)?,
+            tokens_output: row.get(3)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(crate::error::DbError::from)
+}
+
+/// A recent request as the dashboard shows it (no bodies, no secrets).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallLogSummary {
+    pub timestamp: String,
+    pub model: Option<String>,
+    pub requested_model: Option<String>,
+    pub provider: Option<String>,
+    pub status: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub tokens_input: Option<i64>,
+    pub tokens_output: Option<i64>,
+    pub combo_name: Option<String>,
+    pub error_summary: Option<String>,
+}
+
+/// Most recent `call_logs` rows, newest first.
+pub fn recent_calls(conn: &Connection, limit: usize) -> Result<Vec<CallLogSummary>> {
+    let mut statement = conn.prepare(
+        "SELECT timestamp, model, requested_model, provider, status, duration, \
+                tokens_in, tokens_out, combo_name, error_summary \
+         FROM call_logs ORDER BY timestamp DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit as i64], |row| {
+        Ok(CallLogSummary {
+            timestamp: row.get(0)?,
+            model: row.get(1)?,
+            requested_model: row.get(2)?,
+            provider: row.get(3)?,
+            status: row.get(4)?,
+            duration_ms: row.get(5)?,
+            tokens_input: row.get(6)?,
+            tokens_output: row.get(7)?,
+            combo_name: row.get(8)?,
+            error_summary: row.get(9)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(crate::error::DbError::from)
+}
+
+/// Number of API keys that can still authenticate.
+pub fn count_active_api_keys(conn: &Connection) -> Result<usize> {
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM api_keys WHERE revoked_at IS NULL",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(count.max(0) as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

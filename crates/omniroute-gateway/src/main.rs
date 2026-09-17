@@ -262,9 +262,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db = Arc::new(db);
     let (backend, registry, backend_names) = select_backend(db.clone(), &config.data_dir)?;
+    let ui_dir = omniroute_gateway::ui::ui_dir();
+    match ui_dir.as_ref() {
+        Some(dir) => tracing::info!("dashboard served from {}", dir.display()),
+        None => tracing::info!("dashboard not built (API only)"),
+    }
     let state = AppState::with_db(backend, db)
         .with_require_auth(config.require_auth)
-        .with_catalog(registry, backend_names);
+        .with_catalog(registry, backend_names)
+        .with_ui_dir(ui_dir);
     let app = build_router_with_state(state);
 
     let ip: std::net::IpAddr = config.host.parse()?;

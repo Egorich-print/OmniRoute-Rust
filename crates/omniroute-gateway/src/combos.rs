@@ -130,25 +130,34 @@ pub fn plan_steps(
 ) -> Vec<(String, String)> {
     let mut steps = Vec::new();
     for entry in &combo.entries {
-        // Backends are keyed by canonical provider id, while combos may
-        // address a provider by alias (`ds`, `pol`, `kg`).
-        let provider = registry
-            .canonical_id(&entry.provider)
-            .unwrap_or(entry.provider.as_str());
-        // A backend named after the provider serves it directly.
-        if available.contains(provider) {
-            steps.push((provider.to_string(), entry.model.clone()));
-            continue;
-        }
-        if provider == "grok-cli" && available.contains("grok-cli") {
-            steps.push(("grok-cli".to_string(), entry.model.clone()));
-            continue;
-        }
-        if registry.is_openai_format(provider) && available.contains("openai-compatible") {
-            steps.push(("openai-compatible".to_string(), entry.model.clone()));
+        if let Some(backend) = dispatch_backend(entry, registry, available) {
+            steps.push((backend.to_string(), entry.model.clone()));
         }
     }
     steps
+}
+
+/// Backend that would serve one combo entry, given the live backends.
+///
+/// Backends are keyed by canonical provider id while combos may address a
+/// provider by alias (`ds`, `pol`, `kg`), and any OpenAI-format provider can
+/// fall back to the shared `openai-compatible` endpoint. This is the single
+/// place that decides, so the router and the admin UI never disagree.
+pub fn dispatch_backend<'a>(
+    entry: &'a ComboEntry,
+    registry: &'a ProviderRegistry,
+    available: &'a HashSet<String>,
+) -> Option<&'a str> {
+    let provider = registry
+        .canonical_id(&entry.provider)
+        .unwrap_or(entry.provider.as_str());
+    if available.contains(provider) {
+        return Some(provider);
+    }
+    if registry.is_openai_format(provider) && available.contains("openai-compatible") {
+        return Some("openai-compatible");
+    }
+    None
 }
 
 #[cfg(test)]
