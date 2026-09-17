@@ -246,6 +246,7 @@ mod tests {
         ChatMessage {
             role: "user".into(),
             content: Some(serde_json::Value::from(text)),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,

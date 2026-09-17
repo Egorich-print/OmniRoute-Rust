@@ -11,6 +11,7 @@ use omniroute_gateway::{
     backend::EchoBackend,
     build_router_with_state,
     credentials::{active_providers, load_credentials},
+    gemini::GeminiBackend,
     grok_cli::GrokCliBackend,
     openai::{OpenAiBackend, ProviderOpenAiBackend, resolve_chat_url},
     routing::RoutingBackend,
@@ -42,9 +43,11 @@ fn grok_tokens(db: &Db, data_dir: &std::path::Path) -> Vec<String> {
 }
 
 /// Select the serving backend. Builds every configured backend and routes by
-/// model: combo names expand from the database, `grok-*` prefers grok-cli,
-/// everything else prefers an explicit OpenAI-compatible endpoint, and echo
-/// is the ultimate fallback.
+/// model: combo names expand from the database, `provider/model` ids map to
+/// the provider backend, `grok-*` prefers grok-cli, and everything else uses
+/// an explicit OpenAI-compatible endpoint. The echo backend is a test double
+/// and is only registered when `OMNIROUTE_ENABLE_ECHO=1` — it must never
+/// silently answer production traffic.
 type Selected = (Arc<dyn ChatBackend>, Arc<ProviderRegistry>, Vec<String>);
 
 fn select_backend(
@@ -52,7 +55,11 @@ fn select_backend(
     data_dir: &std::path::Path,
 ) -> Result<Selected, Box<dyn std::error::Error>> {
     let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
-    backends.insert("echo".to_string(), Arc::new(EchoBackend));
+    let echo_enabled = std::env::var("OMNIROUTE_ENABLE_ECHO")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+    if echo_enabled {
+        backends.insert("echo".to_string(), Arc::new(EchoBackend));
+    }
 
     let mut grok_present = false;
     let tokens = grok_tokens(&db, data_dir);
@@ -91,12 +98,46 @@ fn select_backend(
         active_providers(&guard).unwrap_or_default()
     };
     for provider in providers {
-        if backends.contains_key(&provider) || !registry.is_openai_format(&provider) {
+        if backends.contains_key(&provider) {
             continue;
         }
         let Some(base_url) = registry.base_url(&provider) else {
             continue;
         };
+
+        // Gemini speaks its own protocol (`generateContent` + API-key header).
+        if registry
+            .get(&provider)
+            .and_then(|entry| entry.format.as_deref())
+            == Some("gemini")
+        {
+            let tokens: Vec<String> = {
+                let guard = db.connection();
+                load_credentials(&guard, &provider, crypto.as_ref())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|credential| credential.token)
+                    .collect()
+            };
+            if tokens.is_empty() {
+                continue;
+            }
+            let count = tokens.len();
+            match GeminiBackend::new(base_url.to_string(), tokens) {
+                Ok(backend) => {
+                    tracing::info!(
+                        "backend available: {provider} (gemini, {base_url}, {count} credential(s))"
+                    );
+                    backends.insert(provider, Arc::new(backend));
+                }
+                Err(error) => tracing::warn!("backend {provider} skipped: {error}"),
+            }
+            continue;
+        }
+
+        if !registry.is_openai_format(&provider) {
+            continue;
+        }
         let tokens: Vec<String> = {
             let guard = db.connection();
             load_credentials(&guard, &provider, crypto.as_ref())
@@ -122,16 +163,17 @@ fn select_backend(
     if grok_present {
         rules.push(RouteRule {
             model_prefix: "grok-".to_string(),
-            backends: vec!["grok-cli".to_string(), "echo".to_string()],
+            backends: vec!["grok-cli".to_string()],
         });
     }
     let mut default = Vec::new();
     if openai_present {
         default.push("openai-compatible".to_string());
     }
-    default.push("echo".to_string());
-
-    tracing::info!("backend available: echo (fallback)");
+    if echo_enabled {
+        default.push("echo".to_string());
+        tracing::info!("backend available: echo (test double, opt-in)");
+    }
     let registry = Arc::new(ProviderRegistry::load());
     let names: Vec<String> = backends.keys().cloned().collect();
     let routing = RoutingBackend::new(backends, Router::new(rules, default))

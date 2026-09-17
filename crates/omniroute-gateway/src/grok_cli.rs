@@ -347,6 +347,7 @@ fn response_to_completion(model: &str, payload: &Value) -> ChatCompletionRespons
         } else {
             Some(Value::from(text))
         },
+        reasoning_content: None,
         tool_calls: has_calls.then_some(Value::Array(tool_calls)),
         tool_call_id: None,
         name: None,

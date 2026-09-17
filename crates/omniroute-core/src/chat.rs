@@ -14,6 +14,9 @@ pub struct ChatMessage {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<Value>,
+    /// Thinking text for models that expose it (DeepSeek/OpenRouter style).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -28,6 +31,7 @@ impl ChatMessage {
         Self {
             role: role.into(),
             content: Some(Value::from(content.into())),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -39,6 +43,7 @@ impl ChatMessage {
         Self {
             role: "assistant".to_string(),
             content: Some(Value::from(text.into())),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -196,6 +201,7 @@ mod tests {
         let plain = ChatMessage {
             role: "user".to_string(),
             content: Some(Value::from("hello")),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -207,6 +213,7 @@ mod tests {
             content: Some(
                 serde_json::json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]),
             ),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,

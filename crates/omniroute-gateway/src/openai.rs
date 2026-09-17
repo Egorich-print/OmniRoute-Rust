@@ -233,6 +233,10 @@ fn openai_payload_to_completion(model: &str, payload: &Value) -> ChatCompletionR
             message: ChatMessage {
                 role: "assistant".to_string(),
                 content,
+                reasoning_content: message
+                    .and_then(|message| message.get("reasoning_content"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 tool_calls,
                 tool_call_id: None,
                 name: None,
@@ -672,6 +676,7 @@ mod tool_passthrough_tests {
                 ChatMessage {
                     role: "assistant".to_string(),
                     content: None,
+                    reasoning_content: None,
                     tool_calls: Some(serde_json::json!([{
                         "id": "call_1",
                         "type": "function",
@@ -683,6 +688,7 @@ mod tool_passthrough_tests {
                 ChatMessage {
                     role: "tool".to_string(),
                     content: Some(serde_json::Value::from("12:00")),
+                    reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: Some("call_1".to_string()),
                     name: None,

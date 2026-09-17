@@ -8,5 +8,6 @@
 pub mod claude;
 pub mod claude_request;
 pub mod gemini;
+pub mod gemini_request;
 pub mod requests;
 pub mod responses;

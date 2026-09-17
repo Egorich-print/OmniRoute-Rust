@@ -69,10 +69,19 @@ impl RoutingBackend {
 
     /// Ordered `(backend, model)` attempts for a requested model name.
     ///
-    /// A combo name expands to its servable entries (with rewritten model
-    /// ids); anything else falls back to prefix routing with the model
-    /// unchanged. An empty plan means "nothing can serve this".
+    /// Resolution order: combo name → `provider/model` id → prefix rule.
+    /// An empty plan means "nothing can serve this", which the caller turns
+    /// into an error (never a fabricated answer).
     fn plan(&self, model: &str) -> Vec<(String, String)> {
+        // `provider/model` ids map straight to a provider backend, which is
+        // what `/v1/models` advertises.
+        if let Some((prefix, rest)) = model.split_once('/')
+            && self.backends.contains_key(prefix)
+            && !rest.is_empty()
+        {
+            return vec![(prefix.to_string(), rest.to_string())];
+        }
+
         if let (Some(db), Some(registry)) = (self.db.as_ref(), self.registry.as_ref()) {
             let guard = db.connection();
             let combos = load_combos(&guard);
@@ -128,7 +137,11 @@ impl ChatBackend for RoutingBackend {
             }
         }
 
-        Err(last_error.unwrap_or(GatewayError::UnknownModel(model)))
+        Err(last_error.unwrap_or_else(|| {
+            GatewayError::UnknownModel(format!(
+                "{model} (no backend can serve it; check the combo entries or provider credentials)"
+            ))
+        }))
     }
 
     fn stream(&self, request: ChatCompletionRequest) -> ChunkStream {
@@ -180,7 +193,11 @@ impl ChatBackend for RoutingBackend {
                 }
             }
 
-            let error = last_error.unwrap_or(GatewayError::UnknownModel(model));
+            let error = last_error.unwrap_or_else(|| {
+                GatewayError::UnknownModel(format!(
+                    "{model} (no backend can serve it; check the combo entries or provider credentials)"
+                ))
+            });
             let _ = tx.send(Err(error)).await;
         });
 
@@ -281,6 +298,34 @@ mod tests {
             .collect();
         let text: String = chunks.iter().filter_map(|c| c.content.clone()).collect();
         assert_eq!(text, "echo: hi");
+    }
+
+    #[tokio::test]
+    async fn provider_model_id_routes_to_provider_backend() {
+        let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
+        backends.insert("openrouter".to_string(), Arc::new(EchoBackend));
+        let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]));
+
+        // `provider/model` ids are what /v1/models advertises; they must route
+        // to the provider backend with the prefix stripped.
+        let response = routing
+            .complete(request("openrouter/anthropic/claude-3-haiku"))
+            .await
+            .unwrap();
+        assert_eq!(response.model, "anthropic/claude-3-haiku");
+    }
+
+    #[tokio::test]
+    async fn unservable_model_errors_instead_of_fabricating() {
+        let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
+        backends.insert("openrouter".to_string(), Arc::new(EchoBackend));
+        let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]));
+        let error = routing
+            .complete(request("gemini/gemini-3.8-flash"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, GatewayError::UnknownModel(_)));
+        assert!(error.to_string().contains("no backend can serve"));
     }
 
     #[tokio::test]

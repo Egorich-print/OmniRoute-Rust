@@ -9,6 +9,7 @@ pub mod auth;
 pub mod backend;
 pub mod combos;
 pub mod credentials;
+pub mod gemini;
 pub mod grok_cli;
 pub mod ids;
 pub mod openai;
@@ -154,14 +155,23 @@ async fn chat_completions(
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
     if request.stream {
+        tracing::info!("completion model={} stream=true", request.model);
         return stream_response(state, request).into_response();
     }
 
     let model = request.model.clone();
     let started = std::time::Instant::now();
+    tracing::info!("completion model={model} stream=false");
     match state.backend.complete(request).await {
         Ok(response) => {
             let latency_ms = started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+            tracing::info!(
+                "completion ok model={model} resolved={} finish={} pt={} ct={} ms={latency_ms}",
+                response.model,
+                response.choices[0].finish_reason,
+                response.usage.prompt_tokens,
+                response.usage.completion_tokens,
+            );
             let usage = response.usage;
             record_completion_usage(&state, &auth, &model, &usage, true, latency_ms, None);
 
@@ -181,6 +191,7 @@ async fn chat_completions(
         }
         Err(error) => {
             let latency_ms = started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+            tracing::warn!("completion failed model={model}: {error}");
             record_completion_usage(
                 &state,
                 &auth,

@@ -27,6 +27,12 @@ pub struct GeminiState {
     /// Human-readable upstream failure, when the stream carried an error
     /// object instead of candidates.
     pub upstream_error: Option<String>,
+    /// Next tool-call index to assign.
+    pub tool_call_index: u32,
+    /// Whether any function call was emitted (drives the finish reason).
+    pub saw_tool_call: bool,
+    /// Whether the `role: "assistant"` announcement already went out.
+    pub role_sent: bool,
 }
 
 /// Token accounting in OpenAI shape.
@@ -77,6 +83,33 @@ pub fn convert_event(state: &mut GeminiState, chunk: &Value, now: i64) -> Vec<Va
         .and_then(Value::as_array)
     {
         for part in parts {
+            // A `functionCall` part is a complete tool call (Gemini does not
+            // stream arguments incrementally), so it maps straight to an
+            // OpenAI tool_calls delta.
+            if let Some(call) = part.get("functionCall") {
+                let name = call.get("name").and_then(Value::as_str).unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+                let index = state.tool_call_index;
+                state.tool_call_index += 1;
+                state.saw_tool_call = true;
+                let arguments = call
+                    .get("args")
+                    .map(|args| args.to_string())
+                    .unwrap_or_else(|| "{}".to_string());
+                out.push(tool_chunk(
+                    state,
+                    now,
+                    json!([{
+                        "index": index,
+                        "id": format!("{}-{index}", state.message_id.as_deref().unwrap_or("call")),
+                        "type": "function",
+                        "function": { "name": name, "arguments": arguments },
+                    }]),
+                ));
+                continue;
+            }
             let text = part.get("text").and_then(Value::as_str).unwrap_or("");
             if text.is_empty() {
                 continue;
@@ -100,7 +133,12 @@ pub fn convert_event(state: &mut GeminiState, chunk: &Value, now: i64) -> Vec<Va
         && !state.finish_sent
     {
         state.finish_sent = true;
-        out.push(finish_chunk(state, now, &normalize_finish_reason(reason)));
+        let reason = if state.saw_tool_call {
+            "tool_calls".to_string()
+        } else {
+            normalize_finish_reason(reason)
+        };
+        out.push(finish_chunk(state, now, &reason));
     }
 
     out
@@ -199,7 +237,8 @@ fn chunk_model(state: &GeminiState) -> String {
     state.model.clone().unwrap_or_else(|| "unknown".to_string())
 }
 
-fn role_chunk(state: &GeminiState, now: i64) -> Value {
+fn role_chunk(state: &mut GeminiState, now: i64) -> Value {
+    state.role_sent = true;
     json!({
         "id": chunk_id(state),
         "object": "chat.completion.chunk",
@@ -226,6 +265,27 @@ fn delta_chunk(
     if let Some(text) = reasoning {
         delta.insert("reasoning_content".to_string(), Value::from(text));
     }
+    json!({
+        "id": chunk_id(state),
+        "object": "chat.completion.chunk",
+        "created": now,
+        "model": chunk_model(state),
+        "choices": [{
+            "index": 0,
+            "delta": Value::Object(delta),
+            "finish_reason": null,
+        }],
+    })
+}
+
+/// Build a tool-calls delta chunk, announcing the role on the first chunk.
+fn tool_chunk(state: &mut GeminiState, now: i64, tool_calls: Value) -> Value {
+    let mut delta = serde_json::Map::new();
+    if !state.role_sent {
+        delta.insert("role".to_string(), Value::from("assistant"));
+        state.role_sent = true;
+    }
+    delta.insert("tool_calls".to_string(), tool_calls);
     json!({
         "id": chunk_id(state),
         "object": "chat.completion.chunk",
