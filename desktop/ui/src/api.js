@@ -20,10 +20,11 @@ export function saveKey(value) {
 /** Gateway base URL.
  *
  * Same origin by default (the gateway serves this bundle itself). Inside the
- * Tauri shell there is no same origin — the bundle runs on a custom scheme
- * while the API lives on loopback — so it points at the gateway directly.
+ * Tauri shell there is no same origin — the shell injects its sidecar URL as
+ * `window.__OMNIROUTE_GATEWAY_URL__` before any bundle code runs.
  * Precedence: build-time `VITE_GATEWAY_URL`, manual `omniroute_gateway_url`
- * in localStorage (for custom ports), Tauri detection, same origin.
+ * in localStorage (for custom ports or remote gateways), the injected
+ * sidecar URL, Tauri loopback default, same origin.
  */
 export function apiBase() {
   const built = import.meta.env.VITE_GATEWAY_URL;
@@ -33,6 +34,9 @@ export function apiBase() {
     if (override && override.trim()) return override.trim().replace(/\/$/, "");
   } catch {
     /* private mode: no overrides */
+  }
+  if (typeof window !== "undefined" && window.__OMNIROUTE_GATEWAY_URL__) {
+    return String(window.__OMNIROUTE_GATEWAY_URL__).replace(/\/$/, "");
   }
   if (typeof window !== "undefined" && window.__TAURI_INTERNALS__) {
     return "http://127.0.0.1:20128";

@@ -1,0 +1,13 @@
+{
+  "name": "omniroute-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OmniRoute desktop shell (Tauri v2) over desktop/ui",
+  "scripts": {
+    "dev:ui": "npm --prefix ui run dev",
+    "build:ui": "npm --prefix ui run build",
+    "build:sidecar": "sh scripts/stage-sidecar.sh",
+    "tauri:dev": "sh -c 'cd src-tauri && cargo tauri dev'",
+    "tauri:build": "sh -c 'cd src-tauri && cargo tauri build'"
+  }
+}

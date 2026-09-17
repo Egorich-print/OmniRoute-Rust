@@ -6,19 +6,16 @@
   "build": {
     "frontendDist": "../ui/dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "npm --prefix ui run dev",
-    "beforeBuildCommand": "npm --prefix ui run build"
+    "beforeDevCommand": {
+      "script": "npm --prefix ui run dev",
+      "cwd": ".."
+    },
+    "beforeBuildCommand": {
+      "script": "npm --prefix ui run build && sh scripts/stage-sidecar.sh",
+      "cwd": ".."
+    }
   },
   "app": {
-    "windows": [
-      {
-        "title": "OmniRoute",
-        "width": 800,
-        "height": 600,
-        "resizable": true,
-        "fullscreen": false
-      }
-    ],
     "security": {
       "csp": null
     }
@@ -33,6 +30,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "externalBin": ["binaries/omniroute-gateway"],
     "android": {
       "debugApplicationIdSuffix": ".debug"
     }
