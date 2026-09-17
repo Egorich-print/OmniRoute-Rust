@@ -50,14 +50,13 @@ pub fn openai_to_gemini(body: &Value) -> Value {
                             if let Some(id) = call.get("id").and_then(Value::as_str) {
                                 call_names.insert(id.to_string(), name.to_string());
                             }
-                            parts.push(json!({
-                                "functionCall": {
-                                    "name": name,
-                                    "args": arguments_object(
-                                        call.get("function").and_then(|f| f.get("arguments"))
-                                    ),
-                                }
-                            }));
+                            parts.push(function_call_part(
+                                name,
+                                arguments_object(
+                                    call.get("function").and_then(|f| f.get("arguments")),
+                                ),
+                                call,
+                            ));
                         }
                     }
                     if !parts.is_empty() {
@@ -217,6 +216,33 @@ pub fn openai_to_gemini(body: &Value) -> Value {
     }
 
     Value::Object(result)
+}
+
+/// Build a `functionCall` part, replaying the thought signature when the
+/// caller still carries it.
+///
+/// Gemini 3 rejects a replayed function call whose signature is missing, so a
+/// signature that came down in `extra_content` (or was injected by the
+/// executor from its cache) has to travel back up untouched.
+fn function_call_part(name: &str, args: Value, call: &Value) -> Value {
+    let mut part = json!({
+        "functionCall": {
+            "name": name,
+            "args": args,
+        }
+    });
+    let signature = call
+        .pointer("/extra_content/google/thought_signature")
+        .or_else(|| call.pointer("/extra_content/google/thoughtSignature"))
+        .or_else(|| call.get("thoughtSignature"))
+        .and_then(Value::as_str)
+        .filter(|signature| !signature.is_empty());
+    if let Some(signature) = signature
+        && let Some(object) = part.as_object_mut()
+    {
+        object.insert("thoughtSignature".to_string(), Value::from(signature));
+    }
+    part
 }
 
 /// Types Gemini's `Schema.Type` enum models.
@@ -523,6 +549,54 @@ mod tests {
         let declarations = openai_to_gemini(&body)["tools"][0]["functionDeclarations"].clone();
         assert_eq!(declarations.as_array().unwrap().len(), 1);
         assert_eq!(declarations[0]["name"], "ok");
+    }
+
+    #[test]
+    fn replays_thought_signature_on_function_calls() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "list files"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "chatcmpl-1-0",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"},
+                    "extra_content": {"google": {"thought_signature": "c2ln"}}
+                }]},
+                {"role": "tool", "tool_call_id": "chatcmpl-1-0", "content": "a.txt"}
+            ]
+        });
+
+        let out = openai_to_gemini(&body);
+        let turn = out["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|turn| turn["role"] == "model")
+            .expect("model turn");
+
+        assert_eq!(turn["parts"][0]["functionCall"]["name"], "bash");
+        assert_eq!(turn["parts"][0]["thoughtSignature"], "c2ln");
+        assert_eq!(turn["parts"][0]["functionCall"]["args"]["command"], "ls");
+    }
+
+    #[test]
+    fn omits_thought_signature_when_absent() {
+        let body = json!({
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "abc-0",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"}
+                }]}
+            ]
+        });
+
+        let out = openai_to_gemini(&body);
+        assert!(
+            out["contents"][0]["parts"][0]
+                .get("thoughtSignature")
+                .is_none()
+        );
     }
 
     #[test]

@@ -7,9 +7,9 @@
 //! closes the stream with usage. The Antigravity `{response:{...}}` wrapper
 //! is unwrapped; upstream error objects are surfaced, not masked.
 //!
-//! Explicitly deferred: functionCall/tool synthesis, thought signatures,
-//! textual `<think>`/`[Tool call:]` parsers, ANSI stripping, promptFeedback
-//! blocks, and the malformed/abort finish-reason overrides.
+//! Explicitly deferred: textual `<think>`/`[Tool call:]` parsers, ANSI
+//! stripping, promptFeedback blocks, and the malformed/abort finish-reason
+//! overrides.
 
 use serde_json::{Value, json};
 
@@ -33,6 +33,14 @@ pub struct GeminiState {
     pub saw_tool_call: bool,
     /// Whether the `role: "assistant"` announcement already went out.
     pub role_sent: bool,
+}
+
+/// Gemini's signature for a thought, under either wire spelling.
+fn thought_signature(part: &Value) -> Option<&str> {
+    part.get("thoughtSignature")
+        .or_else(|| part.get("thought_signature"))
+        .and_then(Value::as_str)
+        .filter(|signature| !signature.is_empty())
 }
 
 /// Token accounting in OpenAI shape.
@@ -98,16 +106,25 @@ pub fn convert_event(state: &mut GeminiState, chunk: &Value, now: i64) -> Vec<Va
                     .get("args")
                     .map(|args| args.to_string())
                     .unwrap_or_else(|| "{}".to_string());
-                out.push(tool_chunk(
-                    state,
-                    now,
-                    json!([{
-                        "index": index,
-                        "id": format!("{}-{index}", state.message_id.as_deref().unwrap_or("call")),
-                        "type": "function",
-                        "function": { "name": name, "arguments": arguments },
-                    }]),
-                ));
+                let id = format!("{}-{index}", state.message_id.as_deref().unwrap_or("call"));
+                let mut tool_call = json!({
+                    "index": index,
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments },
+                });
+                // Gemini 3 refuses a replayed `functionCall` without its
+                // signature. OpenAI has no field for it, so it rides along in
+                // `extra_content` (Google's own OpenAI-compatible convention).
+                if let Some(signature) = thought_signature(part)
+                    && let Some(object) = tool_call.as_object_mut()
+                {
+                    object.insert(
+                        "extra_content".to_string(),
+                        json!({ "google": { "thought_signature": signature } }),
+                    );
+                }
+                out.push(tool_chunk(state, now, json!([tool_call])));
                 continue;
             }
             let text = part.get("text").and_then(Value::as_str).unwrap_or("");
@@ -363,6 +380,46 @@ mod tests {
         );
         assert!(out.is_empty());
         assert_eq!(state.upstream_error.as_deref(), Some("overloaded"));
+    }
+
+    #[test]
+    fn function_call_keeps_thought_signature_in_extra_content() {
+        let mut state = GeminiState {
+            message_id: Some("chatcmpl-1".to_string()),
+            model: Some("g".to_string()),
+            ..Default::default()
+        };
+        let out = convert_event(
+            &mut state,
+            &json!({"candidates": [{"content": {"parts": [{
+                "functionCall": {"name": "bash", "args": {"command": "ls"}},
+                "thoughtSignature": "c2ln"
+            }]}}]}),
+            1700000000,
+        );
+
+        let call = &out[0]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["id"], "chatcmpl-1-0");
+        assert_eq!(call["function"]["name"], "bash");
+        assert_eq!(call["extra_content"]["google"]["thought_signature"], "c2ln");
+        assert!(state.saw_tool_call);
+    }
+
+    #[test]
+    fn function_call_without_signature_has_no_extra_content() {
+        let mut state = GeminiState::default();
+        let out = convert_event(
+            &mut state,
+            &json!({"candidates": [{"content": {"parts": [{
+                "functionCall": {"name": "bash", "args": {}}
+            }]}}]}),
+            1700000000,
+        );
+        assert!(
+            out[0]["choices"][0]["delta"]["tool_calls"][0]
+                .get("extra_content")
+                .is_none()
+        );
     }
 
     #[test]

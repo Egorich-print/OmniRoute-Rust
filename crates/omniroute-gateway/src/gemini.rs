@@ -30,6 +30,106 @@ pub struct GeminiBackend {
     base_url: String,
     tokens: Vec<String>,
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    signatures: std::sync::Arc<ThoughtSignatures>,
+}
+
+/// Tool-call id → Gemini thought signature, kept across a tool round trip.
+///
+/// The signature leaves in `extra_content` for clients that preserve unknown
+/// fields. Clients that rebuild the assistant message from their own schema
+/// drop it, and Gemini then rejects the replayed `functionCall`, so the id we
+/// minted is used as a fallback key. Bounded: the oldest entries fall out
+/// first, and a lost signature only costs one degraded call.
+#[derive(Debug, Default)]
+struct ThoughtSignatures {
+    state: std::sync::Mutex<SignatureState>,
+}
+
+#[derive(Debug, Default)]
+struct SignatureState {
+    order: std::collections::VecDeque<String>,
+    values: std::collections::HashMap<String, String>,
+}
+
+/// Signatures kept before the oldest are evicted.
+const SIGNATURE_CAPACITY: usize = 4096;
+
+impl ThoughtSignatures {
+    fn record(&self, id: &str, signature: &str) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state
+            .values
+            .insert(id.to_string(), signature.to_string())
+            .is_none()
+        {
+            state.order.push_back(id.to_string());
+        }
+        while state.order.len() > SIGNATURE_CAPACITY {
+            if let Some(oldest) = state.order.pop_front() {
+                state.values.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(&self, id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.values.get(id).cloned())
+    }
+}
+
+/// Remember the signatures carried by translated tool calls.
+fn record_signatures(chunk: &Value, signatures: &ThoughtSignatures) {
+    let calls = chunk["choices"][0]["delta"]["tool_calls"]
+        .as_array()
+        .into_iter()
+        .flatten();
+    for call in calls {
+        let (Some(id), Some(signature)) = (
+            call.get("id").and_then(Value::as_str),
+            call.pointer("/extra_content/google/thought_signature")
+                .and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        signatures.record(id, signature);
+    }
+}
+
+/// Fill in signatures a client dropped from replayed tool calls.
+fn inject_signatures(request: &mut ChatCompletionRequest, signatures: &ThoughtSignatures) {
+    for message in &mut request.messages {
+        if message.role != "assistant" {
+            continue;
+        }
+        let Some(calls) = message.tool_calls.as_mut().and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for call in calls {
+            let carried = call
+                .pointer("/extra_content/google/thought_signature")
+                .or_else(|| call.get("thoughtSignature"))
+                .is_some();
+            let Some(id) = call.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if carried {
+                continue;
+            }
+            let Some(signature) = signatures.get(id) else {
+                continue;
+            };
+            if let Some(object) = call.as_object_mut() {
+                object.insert(
+                    "extra_content".to_string(),
+                    json!({ "google": { "thought_signature": signature } }),
+                );
+            }
+        }
+    }
 }
 
 impl GeminiBackend {
@@ -49,6 +149,7 @@ impl GeminiBackend {
             base_url: base_url.trim_end_matches('/').to_string(),
             tokens,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            signatures: std::sync::Arc::new(ThoughtSignatures::default()),
         })
     }
 
@@ -77,12 +178,13 @@ impl GeminiBackend {
 
     async fn drive_stream(
         &self,
-        request: ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
         tx: mpsc::Sender<Result<StreamChunk, GatewayError>>,
     ) -> Result<(), GatewayError> {
         if request.messages.is_empty() {
             return Err(GatewayError::InvalidRequest("messages is empty".into()));
         }
+        inject_signatures(&mut request, &self.signatures);
         let body = Self::gemini_body(&request);
         let url = self.method_url(&request.model, true);
         let key = self.next_token().to_string();
@@ -109,6 +211,7 @@ impl GeminiBackend {
                     Err(_) => continue,
                 };
                 for chunk_json in convert_event(&mut translator, &data, ids::unix_seconds()) {
+                    record_signatures(&chunk_json, &self.signatures);
                     if let Some(stream_chunk) = openai_chunk_to_stream_chunk(&chunk_json)
                         && tx.send(Ok(stream_chunk)).await.is_err()
                     {
@@ -132,11 +235,12 @@ impl ChatBackend for GeminiBackend {
 
     async fn complete(
         &self,
-        request: ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, GatewayError> {
         if request.messages.is_empty() {
             return Err(GatewayError::InvalidRequest("messages is empty".into()));
         }
+        inject_signatures(&mut request, &self.signatures);
         let body = Self::gemini_body(&request);
         let url = self.method_url(&request.model, false);
 
@@ -169,7 +273,7 @@ impl ChatBackend for GeminiBackend {
                 last_error = Some(GatewayError::Upstream(message.to_string()));
                 continue;
             }
-            return Ok(collapse_chunks(&request.model, &payload));
+            return Ok(collapse_chunks(&request.model, &payload, &self.signatures));
         }
         Err(last_error.unwrap_or_else(|| {
             GatewayError::Upstream("gemini: all credentials failed".to_string())
@@ -190,9 +294,16 @@ impl ChatBackend for GeminiBackend {
 
 /// Collapse a full Gemini response into one OpenAI completion by running it
 /// through the streaming translator, so both paths share the same mapping.
-fn collapse_chunks(model: &str, payload: &Value) -> ChatCompletionResponse {
+fn collapse_chunks(
+    model: &str,
+    payload: &Value,
+    signatures: &ThoughtSignatures,
+) -> ChatCompletionResponse {
     let mut state = GeminiState::default();
     let chunks = convert_event(&mut state, payload, ids::unix_seconds());
+    for chunk in &chunks {
+        record_signatures(chunk, signatures);
+    }
 
     let mut text = String::new();
     let mut reasoning = String::new();
@@ -347,6 +458,70 @@ mod tests {
 
         let response = backend.complete(request).await.unwrap();
         assert_eq!(response.choices[0].message.text(), "{}");
+    }
+
+    #[tokio::test]
+    async fn replays_thought_signature_the_client_dropped() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3.8-flash:generateContent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candidates": [{
+                    "content": {"parts": [{
+                        "functionCall": {"name": "bash", "args": {"command": "ls"}},
+                        "thoughtSignature": "c2ln"
+                    }]},
+                    "finishReason": "STOP"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let backend =
+            GeminiBackend::new(format!("{}/models", server.uri()), vec!["k1".to_string()]).unwrap();
+
+        let first = backend.complete(request()).await.unwrap();
+        let call = &first.choices[0].message.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call["extra_content"]["google"]["thought_signature"], "c2ln");
+
+        // The client rebuilds the assistant turn from its own schema, so the
+        // extension field is gone by the time the tool result comes back.
+        let mut follow_up = request();
+        follow_up.messages = vec![
+            ChatMessage::plain("user", "list files"),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(json!([{
+                    "id": call["id"],
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}
+                }])),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: Some(Value::from("a.txt")),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: call["id"].as_str().map(str::to_string),
+                name: None,
+            },
+        ];
+        backend.complete(follow_up).await.unwrap();
+
+        let sent = server.received_requests().await.unwrap();
+        let body = sent.last().unwrap().body_json::<Value>().unwrap();
+        let model_turn = body["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|turn| turn["role"] == "model")
+            .expect("model turn replayed");
+        assert_eq!(model_turn["parts"][0]["thoughtSignature"], "c2ln");
+        assert_eq!(model_turn["parts"][0]["functionCall"]["name"], "bash");
     }
 
     #[tokio::test]
