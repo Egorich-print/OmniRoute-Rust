@@ -42,10 +42,25 @@ fn split_model_ref(model_ref: &str) -> (String, String) {
     }
 }
 
-/// Parse one combo row (`name`, `data` JSON) into a [`ComboDef`].
+/// One combo entry with the dashboard metadata the router ignores.
 ///
-/// Returns `None` when the row carries no usable model entries.
-pub fn parse_combo(name: &str, data: &Value) -> Option<ComboDef> {
+/// `weight` steers the JS dashboard's autorouting; the Rust router honours
+/// listed order for every strategy, so it only round-trips the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RichEntry {
+    /// Provider plus bare model id, as the router sees them.
+    pub entry: ComboEntry,
+    /// Stable per-model id inside the combo (`""` when the row has none).
+    pub id: String,
+    /// Authoring weight (0..=100 by convention).
+    pub weight: i64,
+}
+
+/// Parse one combo row into its strategy plus rich entries.
+///
+/// Returns `None` when the row carries no usable model entries. This is the
+/// single parser; [`parse_combo`] strips it down to what routing needs.
+pub fn parse_combo_rich(data: &Value) -> Option<(String, Vec<RichEntry>)> {
     let models = data.get("models")?.as_array()?;
     let mut entries = Vec::new();
     for item in models {
@@ -74,22 +89,39 @@ pub fn parse_combo(name: &str, data: &Value) -> Option<ComboDef> {
         if provider.is_empty() || bare.is_empty() {
             continue;
         }
-        entries.push(ComboEntry {
-            provider,
-            model: bare,
+        entries.push(RichEntry {
+            entry: ComboEntry {
+                provider,
+                model: bare,
+            },
+            id: item
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            weight: item.get("weight").and_then(Value::as_i64).unwrap_or(0),
         });
     }
     if entries.is_empty() {
         return None;
     }
+    let strategy = data
+        .get("strategy")
+        .and_then(Value::as_str)
+        .unwrap_or("priority")
+        .to_string();
+    Some((strategy, entries))
+}
+
+/// Parse one combo row (`name`, `data` JSON) into a [`ComboDef`].
+///
+/// Returns `None` when the row carries no usable model entries.
+pub fn parse_combo(name: &str, data: &Value) -> Option<ComboDef> {
+    let (strategy, rich) = parse_combo_rich(data)?;
     Some(ComboDef {
         name: name.to_string(),
-        strategy: data
-            .get("strategy")
-            .and_then(Value::as_str)
-            .unwrap_or("priority")
-            .to_string(),
-        entries,
+        strategy,
+        entries: rich.into_iter().map(|item| item.entry).collect(),
     })
 }
 
@@ -234,6 +266,31 @@ mod tests {
     fn empty_combos_parse_to_none() {
         assert_eq!(parse_combo("c", &json!({})), None);
         assert_eq!(parse_combo("c", &json!({"models": []})), None);
+    }
+
+    #[test]
+    fn rich_entries_carry_id_and_weight() {
+        let (strategy, entries) = parse_combo_rich(
+            &json!({
+                "strategy": "auto",
+                "models": [
+                    {"kind": "model", "id": "m1", "model": "groq/openai/gpt-oss-20b", "providerId": "groq", "weight": 95},
+                    {"kind": "model", "model": "gemini/flash", "providerId": "gemini"},
+                    {"kind": "other", "model": "x/y"},
+                    {"kind": "model", "model": ""},
+                ],
+            }),
+        )
+        .unwrap();
+        assert_eq!(strategy, "auto");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "m1");
+        assert_eq!(entries[0].weight, 95);
+        assert_eq!(entries[0].entry.provider, "groq");
+        assert_eq!(entries[0].entry.model, "openai/gpt-oss-20b");
+        // Missing id/weight default to empty/zero rather than failing.
+        assert_eq!(entries[1].id, "");
+        assert_eq!(entries[1].weight, 0);
     }
 
     #[test]

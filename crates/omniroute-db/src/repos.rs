@@ -6,6 +6,7 @@
 //! the Node server extended via later migrations keeps working.
 
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashSet;
 
 use crate::error::Result;
 
@@ -252,12 +253,122 @@ pub fn upsert_combo(conn: &Connection, row: &ComboRow) -> Result<()> {
 /// Fields that `PATCH /api/combos/:id` may change.
 ///
 /// `name` and `sort_order` live both as columns and inside the `data` JSON;
-/// this patch keeps the two copies in sync.
+/// this patch keeps the two copies in sync. `models` replaces the `models`
+/// array wholesale (see [`render_model_items`]); callers must validate first
+/// (non-empty, known providers are the admin layer's job).
 #[derive(Debug, Clone, Default)]
 pub struct ComboMetaPatch {
     pub name: Option<String>,
     pub sort_order: Option<i64>,
     pub is_hidden: Option<bool>,
+    pub strategy: Option<String>,
+    pub models: Option<Vec<ComboModelSpec>>,
+}
+
+/// One model entry for a combo rewrite: provider plus bare model id.
+///
+/// `model` is the bare id exactly as the router derives it (the stored ref
+/// minus its first `provider/` segment), and may itself contain slashes
+/// (`"openai/gpt-oss-20b"`, `"nvidia/nemotron-3-super-120b-a12b"`). It is
+/// joined verbatim: the server never strips prefixes, so a GET → PATCH
+/// round-trip is byte-stable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComboModelSpec {
+    /// Keep this entry id when set and non-blank; otherwise one is derived.
+    pub id: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub weight: i64,
+}
+
+/// Build the `models` JSON array for a combo rewrite.
+///
+/// New model items are emitted in order with generated ids where missing.
+/// When a spec id matches a previous model item, unknown extra keys (e.g. a
+/// JS-side `label`) are carried over so a Rust-side edit never drops data it
+/// does not model. Array items of any other `kind` are preserved verbatim at
+/// the end so a future JS-side kind survives as well.
+fn render_model_items(
+    combo_name: &str,
+    specs: &[ComboModelSpec],
+    previous: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    fn slug(text: &str) -> String {
+        let mut out = String::new();
+        let mut last_dash = true;
+        for ch in text.to_lowercase().chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch);
+                last_dash = false;
+            } else if !last_dash {
+                out.push('-');
+                last_dash = true;
+            }
+            if out.len() >= 40 {
+                break;
+            }
+        }
+        out.trim_matches('-').to_string()
+    }
+
+    let mut taken: HashSet<String> = HashSet::new();
+    let mut consumed: HashSet<String> = HashSet::new();
+    let mut out = Vec::with_capacity(specs.len());
+    for (index, spec) in specs.iter().enumerate() {
+        // Verbatim join: `model` is already the bare id, slashes included.
+        let bare = spec.model.clone();
+        let base = match spec.id.clone().filter(|id| !id.trim().is_empty()) {
+            Some(id) => id.trim().to_string(),
+            None => format!(
+                "{}-model-{}-{}-{}",
+                slug(combo_name),
+                index + 1,
+                slug(&spec.provider),
+                slug(&bare)
+            ),
+        };
+        let mut id = base.clone();
+        let mut counter = 2;
+        while !taken.insert(id.clone()) {
+            id = format!("{base}-{counter}");
+            counter += 1;
+        }
+        // Carry over unknown keys from the previous item with the same id.
+        let mut item = previous
+            .iter()
+            .find(|item| item.get("id").and_then(|id| id.as_str()) == Some(id.as_str()))
+            .filter(|item| {
+                item.get("kind")
+                    .and_then(|kind| kind.as_str())
+                    .is_none_or(|kind| kind == "model")
+            })
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        consumed.insert(id.clone());
+        item["id"] = serde_json::Value::String(id);
+        item["kind"] = serde_json::Value::String("model".to_string());
+        item["model"] = serde_json::Value::String(format!("{}/{}", spec.provider, bare));
+        item["providerId"] = serde_json::Value::String(spec.provider.clone());
+        item["weight"] = serde_json::Value::from(spec.weight);
+        out.push(item);
+    }
+    for item in previous {
+        let id = item
+            .get("id")
+            .and_then(|id| id.as_str())
+            .unwrap_or("");
+        if consumed.contains(id) {
+            continue;
+        }
+        let is_model = item
+            .get("kind")
+            .and_then(|kind| kind.as_str())
+            .is_none_or(|kind| kind == "model");
+        if !is_model {
+            out.push(item.clone());
+        }
+    }
+    out
 }
 
 /// Update combo metadata, keeping the `data` JSON (`name`, `sortOrder`,
@@ -282,6 +393,17 @@ pub fn update_combo_meta(
     let sort_order = patch.sort_order.unwrap_or(current.sort_order);
     if let Some(hidden) = patch.is_hidden {
         data["isHidden"] = serde_json::Value::Bool(hidden);
+    }
+    if let Some(strategy) = patch.strategy.clone() {
+        data["strategy"] = serde_json::Value::String(strategy);
+    }
+    if let Some(specs) = patch.models.as_deref() {
+        let previous: Vec<serde_json::Value> = data
+            .get("models")
+            .and_then(|models| models.as_array())
+            .cloned()
+            .unwrap_or_default();
+        data["models"] = serde_json::Value::Array(render_model_items(&name, specs, &previous));
     }
     data["name"] = serde_json::Value::String(name.clone());
     data["sortOrder"] = serde_json::Value::from(sort_order);
@@ -701,6 +823,77 @@ mod tests {
         assert!(update_combo_meta(&guard, "missing", &ComboMetaPatch::default())
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn combo_models_rewrite_round_trips() {
+        let db = migrated();
+        let guard = db.connection();
+
+        upsert_combo(
+            &guard,
+            &ComboRow {
+                id: "c1".to_string(),
+                name: "mix".to_string(),
+                data: r#"{"name":"mix","strategy":"priority","sortOrder":0,
+                    "models":[
+                        {"id":"keep-me","kind":"model","model":"groq/openai/gpt-oss-20b","providerId":"groq","weight":95,"label":"Fast"},
+                        {"id":"legacy","kind":"widget","model":"x/y"}
+                    ]}"#
+                    .to_string(),
+                sort_order: 0,
+            },
+        )
+        .unwrap();
+
+        let updated = update_combo_meta(
+            &guard,
+            "c1",
+            &ComboMetaPatch {
+                strategy: Some("auto".to_string()),
+                models: Some(vec![
+                    ComboModelSpec {
+                        id: Some("keep-me".to_string()),
+                        provider: "groq".to_string(),
+                        // Joined verbatim: provider + bare id, slashes kept.
+                        model: "openai/gpt-oss-20b".to_string(),
+                        weight: 80,
+                    },
+                    ComboModelSpec {
+                        id: None,
+                        provider: "gemini".to_string(),
+                        model: "gemini-3-flash-preview".to_string(),
+                        weight: 70,
+                    },
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .expect("row exists");
+        let data: serde_json::Value = serde_json::from_str(&updated.data).unwrap();
+        assert_eq!(data["strategy"], serde_json::json!("auto"));
+        let models = data["models"].as_array().unwrap();
+        // Two rewritten models plus the preserved non-model item.
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0]["id"], serde_json::json!("keep-me"));
+        assert_eq!(
+            models[0]["model"],
+            serde_json::json!("groq/openai/gpt-oss-20b")
+        );
+        assert_eq!(models[0]["weight"], serde_json::json!(80));
+        // Unknown extra keys survive the rewrite via the matched id.
+        assert_eq!(models[0]["label"], serde_json::json!("Fast"));
+        assert_eq!(
+            models[1]["model"],
+            serde_json::json!("gemini/gemini-3-flash-preview")
+        );
+        assert!(
+            models[1]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("mix-model-2-gemini-"))
+        );
+        assert_eq!(models[2]["id"], serde_json::json!("legacy"));
     }
 
     #[test]

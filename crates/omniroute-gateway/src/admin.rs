@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::auth::Authenticated;
-use crate::combos::{dispatch_backend, load_combos};
+use crate::combos::{dispatch_backend, parse_combo_rich};
 
 /// Query for the time-ranged endpoints.
 #[derive(Debug, Deserialize)]
@@ -95,33 +95,30 @@ pub async fn combos(State(state): State<AppState>, _auth: Authenticated) -> Json
     let available: std::collections::HashSet<String> =
         state.backend_names.iter().cloned().collect();
     let guard = db.connection();
-    let parsed = load_combos(&guard);
     let mut out: Vec<Value> = Vec::new();
 
     if let Ok(rows) = repos::list_combos(&guard) {
         for row in rows {
-            let combo = parsed.get(&row.name);
-            let entries: Vec<Value> = combo
-                .map(|combo| {
-                    combo
-                        .entries
-                        .iter()
-                        .map(|entry| {
-                            let backend = dispatch_backend(entry, registry, &available);
-                            json!({
-                                "provider": entry.provider,
-                                "model": entry.model,
-                                "backend": backend,
-                                "servable": backend.is_some(),
-                            })
-                        })
-                        .collect()
+            let data: Value = serde_json::from_str(&row.data).unwrap_or(Value::Null);
+            let (strategy, rich) = parse_combo_rich(&data).unwrap_or_default();
+            let entries: Vec<Value> = rich
+                .iter()
+                .map(|item| {
+                    let backend = dispatch_backend(&item.entry, registry, &available);
+                    json!({
+                        "id": item.id,
+                        "provider": item.entry.provider,
+                        "model": item.entry.model,
+                        "weight": item.weight,
+                        "backend": backend,
+                        "servable": backend.is_some(),
+                    })
                 })
-                .unwrap_or_default();
+                .collect();
             out.push(json!({
                 "id": row.id,
                 "name": row.name,
-                "strategy": combo.map(|combo| combo.strategy.clone()).unwrap_or_default(),
+                "strategy": strategy,
                 "sort_order": row.sort_order,
                 "is_hidden": is_hidden(&row.data),
                 "servable_entries": entries.iter().filter(|entry| entry["servable"] == json!(true)).count(),
@@ -285,6 +282,26 @@ pub struct UpdateComboBody {
     pub name: Option<String>,
     pub sort_order: Option<i64>,
     pub is_hidden: Option<bool>,
+    pub strategy: Option<String>,
+    pub models: Option<Vec<ComboModelBody>>,
+}
+
+/// One model entry in a combo rewrite: provider plus bare model id.
+///
+/// `weight` defaults to 50 when absent. Entry `id` is kept when sent back
+/// (the dashboard round-trips it); otherwise the server derives one.
+#[derive(Debug, Deserialize)]
+pub struct ComboModelBody {
+    pub id: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub weight: Option<i64>,
+}
+
+/// Strategies the gateway understands. Anything else is a 400: storing an
+/// unknown strategy would silently change routing semantics.
+fn is_known_strategy(strategy: &str) -> bool {
+    matches!(strategy, "priority" | "auto")
 }
 
 /// Body for `PATCH /api/connections/:id`. Every field is optional; absent
@@ -301,11 +318,12 @@ fn is_unique_violation(error: &omniroute_db::DbError) -> bool {
     error.to_string().contains("UNIQUE constraint failed")
 }
 
-/// `PATCH /api/combos/:id` — rename, reorder or hide a combo.
+/// `PATCH /api/combos/:id` — rename, reorder, hide, restyle or restock a combo.
 ///
 /// Combo routing reads the database on every request, so the change takes
 /// effect immediately. `404` when `id` is unknown, `409` when `name` collides
-/// with another combo, `400` when the body carries nothing usable.
+/// with another combo, `400` when the body carries nothing usable, names an
+/// unknown strategy, or sends an empty/unusable model list.
 pub async fn update_combo(
     State(state): State<AppState>,
     _auth: Authenticated,
@@ -320,12 +338,59 @@ pub async fn update_combo(
             Json(json!({ "error": "name must not be empty" })),
         );
     }
+    if let Some(strategy) = body.strategy.as_deref()
+        && !is_known_strategy(strategy)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "strategy must be \"priority\" or \"auto\"" })),
+        );
+    }
+    let mut models: Option<Vec<repos::ComboModelSpec>> = None;
+    if let Some(items) = body.models.as_deref() {
+        if items.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "models must not be empty" })),
+            );
+        }
+        let mut specs = Vec::with_capacity(items.len());
+        for item in items {
+            if item.provider.trim().is_empty() || item.model.trim().is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "every model needs a provider and a model id" })),
+                );
+            }
+            let weight = item.weight.unwrap_or(50);
+            if !(0..=100).contains(&weight) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "weight must be between 0 and 100" })),
+                );
+            }
+            specs.push(repos::ComboModelSpec {
+                id: item.id.clone(),
+                provider: item.provider.trim().to_string(),
+                model: item.model.trim().to_string(),
+                weight,
+            });
+        }
+        models = Some(specs);
+    }
     let patch = repos::ComboMetaPatch {
         name: body.name.map(|name| name.trim().to_string()),
         sort_order: body.sort_order,
         is_hidden: body.is_hidden,
+        strategy: body.strategy,
+        models,
     };
-    if patch.name.is_none() && patch.sort_order.is_none() && patch.is_hidden.is_none() {
+    if patch.name.is_none()
+        && patch.sort_order.is_none()
+        && patch.is_hidden.is_none()
+        && patch.strategy.is_none()
+        && patch.models.is_none()
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "no fields to update" })),
