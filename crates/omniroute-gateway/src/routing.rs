@@ -32,6 +32,50 @@ pub struct RoutingBackend {
     registry: Option<Arc<ProviderRegistry>>,
 }
 
+/// Whether a failure means the backend itself is unhealthy.
+///
+/// A provider answering 4xx — "model not found", "no access", "bad payload" —
+/// is healthy: it served the request, it just refused it. Tripping its breaker
+/// over one dead model id takes every *other* model on that provider down for
+/// the whole cooldown, which is how a single stale combo entry used to disable
+/// a working provider.
+fn is_backend_outage(error: &GatewayError) -> bool {
+    match error {
+        GatewayError::Upstream(message) => match upstream_status(message) {
+            Some(status) => status >= 500,
+            // No status means the call never landed (transport, DNS, TLS,
+            // exhausted credentials): the backend is unreachable.
+            None => true,
+        },
+        // Nothing-to-serve is a routing outcome, not a backend fault.
+        GatewayError::UnknownModel(_) | GatewayError::InvalidRequest(_) => false,
+    }
+}
+
+/// Parse the code out of the HTTP client's `upstream status {code}: {body}`.
+fn upstream_status(message: &str) -> Option<u16> {
+    let rest = message.strip_prefix("upstream status ")?;
+    rest.chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// Error for a plan that exists but is entirely in breaker cooldown.
+fn all_candidates_tripped(model: &str) -> GatewayError {
+    GatewayError::Upstream(format!(
+        "{model}: every candidate backend is in breaker cooldown after recent failures; retry shortly"
+    ))
+}
+
+/// Error for a model no configured backend can serve at all.
+fn no_candidate(model: &str) -> GatewayError {
+    GatewayError::UnknownModel(format!(
+        "{model} (no backend can serve it; check the combo entries or provider credentials)"
+    ))
+}
+
 impl RoutingBackend {
     /// Build with default breaker settings (3 failures, 60s cooldown).
     pub fn new(backends: HashMap<String, Arc<dyn ChatBackend>>, router: Router) -> Self {
@@ -122,9 +166,11 @@ impl ChatBackend for RoutingBackend {
     ) -> Result<ChatCompletionResponse, GatewayError> {
         let model = request.model.clone();
         let mut last_error: Option<GatewayError> = None;
+        let mut tripped = false;
 
         for (name, target_model) in self.plan(&model) {
             if !self.lock_breakers().allow(&name, Instant::now()) {
+                tripped = true;
                 continue;
             }
             let Some(backend) = self.backends.get(&name) else {
@@ -138,16 +184,20 @@ impl ChatBackend for RoutingBackend {
                     return Ok(response);
                 }
                 Err(error) => {
-                    self.lock_breakers().record_failure(&name, Instant::now());
+                    if is_backend_outage(&error) {
+                        self.lock_breakers().record_failure(&name, Instant::now());
+                    }
                     last_error = Some(error);
                 }
             }
         }
 
         Err(last_error.unwrap_or_else(|| {
-            GatewayError::UnknownModel(format!(
-                "{model} (no backend can serve it; check the combo entries or provider credentials)"
-            ))
+            if tripped {
+                all_candidates_tripped(&model)
+            } else {
+                no_candidate(&model)
+            }
         }))
     }
 
@@ -158,9 +208,11 @@ impl ChatBackend for RoutingBackend {
 
         tokio::spawn(async move {
             let mut last_error: Option<GatewayError> = None;
+            let mut tripped = false;
 
             for (name, target_model) in this.plan(&model) {
                 if !this.lock_breakers().allow(&name, Instant::now()) {
+                    tripped = true;
                     continue;
                 }
                 let Some(backend) = this.backends.get(&name).cloned() else {
@@ -188,7 +240,9 @@ impl ChatBackend for RoutingBackend {
                         return; // stream finished normally
                     }
                     Some(Err(error)) => {
-                        this.lock_breakers().record_failure(&name, Instant::now());
+                        if is_backend_outage(&error) {
+                            this.lock_breakers().record_failure(&name, Instant::now());
+                        }
                         last_error = Some(error);
                         continue;
                     }
@@ -201,9 +255,11 @@ impl ChatBackend for RoutingBackend {
             }
 
             let error = last_error.unwrap_or_else(|| {
-                GatewayError::UnknownModel(format!(
-                    "{model} (no backend can serve it; check the combo entries or provider credentials)"
-                ))
+                if tripped {
+                    all_candidates_tripped(&model)
+                } else {
+                    no_candidate(&model)
+                }
             });
             let _ = tx.send(Err(error)).await;
         });
@@ -240,6 +296,33 @@ mod tests {
         }
     }
 
+    /// A backend that always answers with one upstream status.
+    #[derive(Debug, Clone)]
+    struct StatusBackend {
+        status: u16,
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl ChatBackend for StatusBackend {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        async fn complete(
+            &self,
+            _request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Err(GatewayError::Upstream(format!(
+                "upstream status {}: nope",
+                self.status
+            )))
+        }
+        fn stream(&self, _request: ChatCompletionRequest) -> ChunkStream {
+            let error = GatewayError::Upstream(format!("upstream status {}: nope", self.status));
+            Box::pin(futures::stream::once(async move { Err(error) }))
+        }
+    }
+
     fn request(model: &str) -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: model.to_string(),
@@ -266,6 +349,107 @@ mod tests {
             vec!["echo".to_string()],
         );
         RoutingBackend::with_breaker_settings(backends, router, 1, 3600)
+    }
+
+    #[test]
+    fn only_provider_outages_are_breaker_failures() {
+        // 4xx: the provider answered, it just refused this one request.
+        assert!(!is_backend_outage(&GatewayError::Upstream(
+            "upstream status 404: {\"error\":\"model not found\"}".to_string()
+        )));
+        assert!(!is_backend_outage(&GatewayError::Upstream(
+            "upstream status 410: gone".to_string()
+        )));
+        assert!(!is_backend_outage(&GatewayError::Upstream(
+            "upstream status 400: bad payload".to_string()
+        )));
+        assert!(!is_backend_outage(&GatewayError::Upstream(
+            "upstream status 429: slow down".to_string()
+        )));
+        // 5xx and transport failures: the backend is unhealthy.
+        assert!(is_backend_outage(&GatewayError::Upstream(
+            "upstream status 503: overloaded".to_string()
+        )));
+        assert!(is_backend_outage(&GatewayError::Upstream(
+            "upstream status 500: boom".to_string()
+        )));
+        assert!(is_backend_outage(&GatewayError::Upstream(
+            "grok-cli: all credentials failed".to_string()
+        )));
+        // Routing outcomes are never backend faults.
+        assert!(!is_backend_outage(&GatewayError::UnknownModel(
+            "nope".to_string()
+        )));
+        assert!(!is_backend_outage(&GatewayError::InvalidRequest(
+            "messages is empty".to_string()
+        )));
+    }
+
+    #[test]
+    fn upstream_status_is_parsed_from_the_client_message() {
+        assert_eq!(upstream_status("upstream status 404: nope"), Some(404));
+        assert_eq!(upstream_status("upstream status 503: busy"), Some(503));
+        assert_eq!(upstream_status("upstream status : weird"), None);
+        assert_eq!(upstream_status("transport error"), None);
+    }
+
+    #[tokio::test]
+    async fn dead_model_does_not_trip_the_whole_backend() {
+        // `fail` answers like a provider that does not serve the model; a
+        // second model on the same backend must still be served.
+        let mut backends: HashMap<String, std::sync::Arc<dyn ChatBackend>> = HashMap::new();
+        backends.insert(
+            "gone".to_string(),
+            std::sync::Arc::new(StatusBackend {
+                status: 404,
+                name: "gone",
+            }),
+        );
+        backends.insert("echo".to_string(), std::sync::Arc::new(EchoBackend));
+        let router = Router::new(
+            vec![RouteRule {
+                model_prefix: "x-".to_string(),
+                backends: vec!["gone".to_string(), "echo".to_string()],
+            }],
+            vec!["echo".to_string()],
+        );
+        // Threshold 1: a single counted failure would trip the backend.
+        let routing = RoutingBackend::with_breaker_settings(backends, router, 1, 3600);
+
+        for _ in 0..3 {
+            let response = routing.complete(request("x-model")).await.unwrap();
+            assert_eq!(response.choices[0].message.text(), "echo: hi");
+        }
+    }
+
+    #[tokio::test]
+    async fn tripped_candidates_report_cooldown_not_an_unknown_model() {
+        let mut backends: HashMap<String, std::sync::Arc<dyn ChatBackend>> = HashMap::new();
+        backends.insert(
+            "down".to_string(),
+            std::sync::Arc::new(StatusBackend {
+                status: 503,
+                name: "down",
+            }),
+        );
+        let router = Router::new(
+            vec![RouteRule {
+                model_prefix: "x-".to_string(),
+                backends: vec!["down".to_string()],
+            }],
+            vec![],
+        );
+        let routing = RoutingBackend::with_breaker_settings(backends, router, 1, 3600);
+
+        // First call trips the breaker on the 503.
+        let first = routing.complete(request("x-model")).await.unwrap_err();
+        assert!(matches!(first, GatewayError::Upstream(_)), "{first:?}");
+
+        // The next call has no allowed candidate: say so instead of pretending
+        // the model is unknown.
+        let second = routing.complete(request("x-model")).await.unwrap_err();
+        let message = second.to_string();
+        assert!(message.contains("breaker cooldown"), "{message}");
     }
 
     #[tokio::test]
