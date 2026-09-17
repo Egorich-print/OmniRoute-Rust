@@ -74,12 +74,19 @@ impl RoutingBackend {
     /// into an error (never a fabricated answer).
     fn plan(&self, model: &str) -> Vec<(String, String)> {
         // `provider/model` ids map straight to a provider backend, which is
-        // what `/v1/models` advertises.
+        // what `/v1/models` advertises. The prefix may be an alias (`ds/…`),
+        // so it is canonicalized before the backend lookup.
         if let Some((prefix, rest)) = model.split_once('/')
-            && self.backends.contains_key(prefix)
             && !rest.is_empty()
         {
-            return vec![(prefix.to_string(), rest.to_string())];
+            let provider = self
+                .registry
+                .as_ref()
+                .and_then(|registry| registry.canonical_id(prefix))
+                .unwrap_or(prefix);
+            if self.backends.contains_key(provider) {
+                return vec![(provider.to_string(), rest.to_string())];
+            }
         }
 
         if let (Some(db), Some(registry)) = (self.db.as_ref(), self.registry.as_ref()) {
@@ -341,6 +348,29 @@ mod tests {
             .filter_map(|chunk| chunk.content.clone())
             .collect();
         assert_eq!(text, "echo: hi");
+    }
+
+    #[tokio::test]
+    async fn alias_prefixed_model_reaches_the_canonical_backend() {
+        use omniroute_db::Db;
+        use omniroute_providers::ProviderRegistry;
+
+        let db = std::sync::Arc::new(Db::open_in_memory().unwrap());
+        db.migrate().unwrap();
+
+        let mut backends: HashMap<String, std::sync::Arc<dyn ChatBackend>> = HashMap::new();
+        // `kg` is the alias of `kilo-gateway`; the backend is keyed by id.
+        backends.insert("kilo-gateway".to_string(), std::sync::Arc::new(EchoBackend));
+        backends.insert("echo".to_string(), std::sync::Arc::new(EchoBackend));
+        let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]))
+            .with_combo_source(db, std::sync::Arc::new(ProviderRegistry::load()));
+
+        let response = routing
+            .complete(request("kg/kilo-auto/balanced"))
+            .await
+            .unwrap();
+        assert_eq!(response.model, "kilo-auto/balanced");
+        assert_eq!(response.choices[0].message.text(), "echo: hi");
     }
 
     #[tokio::test]

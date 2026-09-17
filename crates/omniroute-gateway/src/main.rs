@@ -146,13 +146,21 @@ fn select_backend(
                 .map(|credential| credential.token)
                 .collect()
         };
-        if tokens.is_empty() {
+        // Public gateways (`auth_type: optional`) answer without a key, so an
+        // empty pool is only fatal when the provider actually needs one.
+        if tokens.is_empty() && !registry.allows_keyless(&provider) {
             continue;
         }
         let count = tokens.len();
         match ProviderOpenAiBackend::new(provider.clone(), resolve_chat_url(base_url), tokens) {
             Ok(backend) => {
-                tracing::info!("backend available: {provider} ({base_url}, {count} credential(s))");
+                if count == 0 {
+                    tracing::info!("backend available: {provider} ({base_url}, keyless)");
+                } else {
+                    tracing::info!(
+                        "backend available: {provider} ({base_url}, {count} credential(s))"
+                    );
+                }
                 backends.insert(provider, Arc::new(backend));
             }
             Err(error) => tracing::warn!("backend {provider} skipped: {error}"),

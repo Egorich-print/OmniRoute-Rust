@@ -67,11 +67,19 @@ impl ProviderRegistry {
     }
 
     fn from_entries(entries: Vec<ProviderEntry>) -> Self {
-        let by_id = entries
+        let mut by_id: HashMap<String, usize> = entries
             .iter()
             .enumerate()
             .map(|(index, entry)| (entry.id.clone(), index))
             .collect();
+        // Stored combos and clients address some providers by alias
+        // (`ds/…`, `pol/…`, `kg/…`), so aliases resolve too. A real id always
+        // wins over an alias that collides with one.
+        for (index, entry) in entries.iter().enumerate() {
+            if let Some(alias) = entry.alias.as_deref().filter(|alias| !alias.is_empty()) {
+                by_id.entry(alias.to_string()).or_insert(index);
+            }
+        }
         Self { entries, by_id }
     }
 
@@ -100,6 +108,24 @@ impl ProviderRegistry {
         self.by_id
             .get(id)
             .and_then(|index| self.entries.get(*index))
+    }
+
+    /// Canonical id for a provider id or alias.
+    ///
+    /// Backends are keyed by canonical id, so any provider reference coming
+    /// from a combo or a `provider/model` request has to be resolved first.
+    pub fn canonical_id(&self, provider: &str) -> Option<&str> {
+        self.get(provider).map(|entry| entry.id.as_str())
+    }
+
+    /// Whether the provider is usable without a credential.
+    ///
+    /// `auth_type: optional` providers (public gateways) answer without a
+    /// key; requiring one would silently drop them from the backend set.
+    pub fn allows_keyless(&self, provider: &str) -> bool {
+        self.get(provider)
+            .and_then(|entry| entry.auth_type.as_deref())
+            .is_some_and(|auth_type| matches!(auth_type, "optional" | "none"))
     }
 
     /// Effective target format for a model: the model's explicit
@@ -141,6 +167,68 @@ mod tests {
 
     fn registry() -> ProviderRegistry {
         ProviderRegistry::load()
+    }
+
+    #[test]
+    fn aliases_resolve_to_the_provider_entry() {
+        let registry = registry();
+        for (alias, id) in [
+            ("ds", "deepseek"),
+            ("pol", "pollinations"),
+            ("kg", "kilo-gateway"),
+        ] {
+            let entry = registry
+                .get(alias)
+                .unwrap_or_else(|| panic!("alias {alias} did not resolve"));
+            assert_eq!(entry.id, id, "alias {alias} resolved to {}", entry.id);
+            assert_eq!(registry.canonical_id(alias), Some(id));
+            // Everything that reads the entry works through the alias too.
+            assert!(
+                registry.base_url(alias).is_some(),
+                "{alias} has no base_url"
+            );
+            assert_eq!(
+                registry.is_openai_format(alias),
+                registry.is_openai_format(id),
+                "{alias} format diverged from {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_id_wins_over_a_colliding_alias() {
+        let entries = vec![
+            ProviderEntry {
+                id: "alpha".to_string(),
+                alias: Some("beta".to_string()),
+                format: Some("openai".to_string()),
+                executor: Some("default".to_string()),
+                auth_type: Some("apikey".to_string()),
+                base_url: Some("https://alpha.example/v1".to_string()),
+                models: Vec::new(),
+            },
+            ProviderEntry {
+                id: "beta".to_string(),
+                alias: Some("gamma".to_string()),
+                format: Some("openai".to_string()),
+                executor: Some("default".to_string()),
+                auth_type: Some("apikey".to_string()),
+                base_url: Some("https://beta.example/v1".to_string()),
+                models: Vec::new(),
+            },
+        ];
+        let registry = ProviderRegistry::from_entries(entries);
+        assert_eq!(registry.canonical_id("beta"), Some("beta"));
+        assert_eq!(registry.base_url("beta"), Some("https://beta.example/v1"));
+        assert_eq!(registry.canonical_id("gamma"), Some("beta"));
+    }
+
+    #[test]
+    fn keyless_is_reported_for_optional_auth() {
+        let registry = registry();
+        assert!(registry.allows_keyless("pollinations"));
+        assert!(!registry.allows_keyless("openrouter"));
+        assert!(!registry.allows_keyless("nope"));
     }
 
     #[test]

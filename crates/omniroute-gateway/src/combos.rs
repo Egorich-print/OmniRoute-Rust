@@ -130,16 +130,21 @@ pub fn plan_steps(
 ) -> Vec<(String, String)> {
     let mut steps = Vec::new();
     for entry in &combo.entries {
+        // Backends are keyed by canonical provider id, while combos may
+        // address a provider by alias (`ds`, `pol`, `kg`).
+        let provider = registry
+            .canonical_id(&entry.provider)
+            .unwrap_or(entry.provider.as_str());
         // A backend named after the provider serves it directly.
-        if available.contains(entry.provider.as_str()) {
-            steps.push((entry.provider.clone(), entry.model.clone()));
+        if available.contains(provider) {
+            steps.push((provider.to_string(), entry.model.clone()));
             continue;
         }
-        if entry.provider == "grok-cli" && available.contains("grok-cli") {
+        if provider == "grok-cli" && available.contains("grok-cli") {
             steps.push(("grok-cli".to_string(), entry.model.clone()));
             continue;
         }
-        if registry.is_openai_format(&entry.provider) && available.contains("openai-compatible") {
+        if registry.is_openai_format(provider) && available.contains("openai-compatible") {
             steps.push(("openai-compatible".to_string(), entry.model.clone()));
         }
     }
@@ -181,6 +186,38 @@ mod tests {
                 provider: "openrouter".to_string(),
                 model: "anthropic/claude-3-haiku".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn alias_entries_dispatches_to_the_canonical_backend() {
+        let registry = ProviderRegistry::load();
+        let combo = parse_combo(
+            "c",
+            &json!({
+                "strategy": "priority",
+                "models": [
+                    {"kind": "model", "model": "pol/gemini", "providerId": "pol"},
+                    {"kind": "model", "model": "kg/kilo-auto/balanced", "providerId": "kg"},
+                    {"kind": "model", "model": "ds/deepseek-v4-flash", "providerId": "ds"},
+                ],
+            }),
+        )
+        .unwrap();
+
+        let available: HashSet<String> = ["pollinations", "kilo-gateway"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let steps = plan_steps(&combo, &registry, &available);
+
+        assert_eq!(
+            steps,
+            vec![
+                ("pollinations".to_string(), "gemini".to_string()),
+                ("kilo-gateway".to_string(), "kilo-auto/balanced".to_string()),
+            ],
+            "aliases must map onto canonical backend keys; `ds` has no executor yet"
         );
     }
 

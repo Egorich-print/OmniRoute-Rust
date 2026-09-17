@@ -393,17 +393,14 @@ pub struct ProviderOpenAiBackend {
 
 impl ProviderOpenAiBackend {
     /// Build for `provider` against `chat_url` with a credential pool.
+    ///
+    /// An empty pool is allowed: `auth_type: optional` providers serve
+    /// anonymous traffic, and the request then goes out without a bearer.
     pub fn new(
         provider: String,
         chat_url: String,
         tokens: Vec<String>,
     ) -> Result<Self, omniroute_http::client::HttpError> {
-        if tokens.is_empty() {
-            return Err(omniroute_http::client::HttpError::Status {
-                status: 0,
-                body: format!("{provider}: no credentials"),
-            });
-        }
         Ok(Self {
             http: HttpClient::new(600)?,
             provider,
@@ -418,10 +415,13 @@ impl ProviderOpenAiBackend {
         self.tokens.len()
     }
 
-    fn next_token(&self) -> &str {
+    fn next_token(&self) -> Option<&str> {
+        if self.tokens.is_empty() {
+            return None;
+        }
         let index =
             self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.tokens.len();
-        self.tokens[index].as_str()
+        self.tokens.get(index).map(String::as_str)
     }
 
     async fn drive_stream(
@@ -436,7 +436,7 @@ impl ProviderOpenAiBackend {
         body["stream"] = Value::from(true);
         let response = self
             .http
-            .post_json(&self.chat_url, Some(self.next_token()), &body)
+            .post_json(&self.chat_url, self.next_token(), &body)
             .await
             .map_err(|error| GatewayError::Upstream(error.to_string()))?;
 
@@ -500,10 +500,11 @@ impl ChatBackend for ProviderOpenAiBackend {
         body["stream"] = Value::from(false);
 
         let mut last_error: Option<GatewayError> = None;
-        for _ in 0..self.tokens.len() {
+        // A keyless provider gets exactly one attempt, a pool one per key.
+        for _ in 0..self.tokens.len().max(1) {
             let response = match self
                 .http
-                .post_json(&self.chat_url, Some(self.next_token()), &body)
+                .post_json(&self.chat_url, self.next_token(), &body)
                 .await
             {
                 Ok(response) => response,
@@ -595,6 +596,58 @@ mod provider_tests {
         let response = backend
             .complete(ChatCompletionRequest {
                 model: "some/model:free".to_string(),
+                messages: vec![ChatMessage::plain("user".to_string(), "hi".to_string())],
+                stream: false,
+                max_tokens: None,
+                temperature: None,
+                top_p: None,
+                tools: None,
+                tool_choice: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.choices[0].message.text(), "hi");
+    }
+
+    #[tokio::test]
+    async fn keyless_provider_sends_no_bearer() {
+        use wiremock::matchers::header_exists;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "1",
+                "model": "gemini",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hi"},
+                    "finish_reason": "stop",
+                }],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = ProviderOpenAiBackend::new(
+            "pollinations".to_string(),
+            resolve_chat_url(&format!("{}/v1", server.uri())),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(backend.token_count(), 0);
+
+        let response = backend
+            .complete(ChatCompletionRequest {
+                model: "gemini".to_string(),
                 messages: vec![ChatMessage::plain("user".to_string(), "hi".to_string())],
                 stream: false,
                 max_tokens: None,
