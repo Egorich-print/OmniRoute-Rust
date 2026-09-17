@@ -11,19 +11,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use omniroute_core::{ChatCompletionRequest, ChatCompletionResponse, GatewayError};
 use omniroute_db::Db;
 use omniroute_providers::ProviderRegistry;
 use omniroute_routing::{BreakerSet, Router};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::{ChatBackend, ChunkStream};
 use crate::combos::{load_combos, plan_steps};
 
 /// Backend router with failover.
+#[derive(Clone)]
 pub struct RoutingBackend {
-    backends: HashMap<String, Arc<dyn ChatBackend>>,
-    router: Router,
-    breakers: Mutex<BreakerSet>,
+    backends: Arc<HashMap<String, Arc<dyn ChatBackend>>>,
+    router: Arc<Router>,
+    breakers: Arc<Mutex<BreakerSet>>,
     db: Option<Arc<Db>>,
     registry: Option<Arc<ProviderRegistry>>,
 }
@@ -42,9 +46,9 @@ impl RoutingBackend {
         cooldown_secs: u64,
     ) -> Self {
         Self {
-            backends,
-            router,
-            breakers: Mutex::new(BreakerSet::new(threshold, cooldown_secs)),
+            backends: Arc::new(backends),
+            router: Arc::new(router),
+            breakers: Arc::new(Mutex::new(BreakerSet::new(threshold, cooldown_secs))),
             db: None,
             registry: None,
         }
@@ -128,20 +132,59 @@ impl ChatBackend for RoutingBackend {
     }
 
     fn stream(&self, request: ChatCompletionRequest) -> ChunkStream {
+        let this = self.clone();
         let model = request.model.clone();
-        for (name, target_model) in self.plan(&model) {
-            if !self.lock_breakers().allow(&name, Instant::now()) {
-                continue;
-            }
-            if let Some(backend) = self.backends.get(&name) {
+        let (tx, rx) = mpsc::channel(64);
+
+        tokio::spawn(async move {
+            let mut last_error: Option<GatewayError> = None;
+
+            for (name, target_model) in this.plan(&model) {
+                if !this.lock_breakers().allow(&name, Instant::now()) {
+                    continue;
+                }
+                let Some(backend) = this.backends.get(&name).cloned() else {
+                    continue;
+                };
                 let mut attempt = request.clone();
                 attempt.model = target_model;
-                return backend.stream(attempt);
+                let mut stream = backend.stream(attempt);
+
+                // Pull the first item before committing to this backend: a
+                // free tier answering 503 has emitted nothing, so the combo
+                // can still hop to the next model instead of failing the
+                // whole request.
+                match stream.next().await {
+                    Some(Ok(first)) => {
+                        this.lock_breakers().record_success(&name);
+                        if tx.send(Ok(first)).await.is_err() {
+                            return; // client gone
+                        }
+                        while let Some(item) = stream.next().await {
+                            if tx.send(item).await.is_err() {
+                                return;
+                            }
+                        }
+                        return; // stream finished normally
+                    }
+                    Some(Err(error)) => {
+                        this.lock_breakers().record_failure(&name, Instant::now());
+                        last_error = Some(error);
+                        continue;
+                    }
+                    None => {
+                        // Empty stream: acceptable, nothing to fall back to.
+                        this.lock_breakers().record_success(&name);
+                        return;
+                    }
+                }
             }
-        }
-        Box::pin(futures::stream::once(async move {
-            Err(GatewayError::UnknownModel(model))
-        }))
+
+            let error = last_error.unwrap_or(GatewayError::UnknownModel(model));
+            let _ = tx.send(Err(error)).await;
+        });
+
+        Box::pin(ReceiverStream::new(rx))
     }
 }
 
@@ -237,6 +280,20 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         let text: String = chunks.iter().filter_map(|c| c.content.clone()).collect();
+        assert_eq!(text, "echo: hi");
+    }
+
+    #[tokio::test]
+    async fn stream_fails_over_when_first_backend_errors() {
+        let routing = routing();
+        // The `x-` rule tries "fail" first; streaming must now hop to echo
+        // instead of surfacing the error, which is what free tiers need.
+        let chunks: Vec<_> = routing.stream(request("x-model")).collect::<Vec<_>>().await;
+        let text: String = chunks
+            .iter()
+            .map(|item| item.as_ref().expect("no error after failover"))
+            .filter_map(|chunk| chunk.content.clone())
+            .collect();
         assert_eq!(text, "echo: hi");
     }
 
