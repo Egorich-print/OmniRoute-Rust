@@ -6,7 +6,9 @@
 //! translation layer in front of [`backend::ChatBackend`] later.
 
 pub mod admin;
+pub mod apikeys;
 pub mod auth;
+pub mod cors;
 pub mod backend;
 pub mod combos;
 pub mod credentials;
@@ -15,6 +17,7 @@ pub mod grok_cli;
 pub mod ids;
 pub mod openai;
 pub mod responses;
+pub mod restart;
 pub mod routing;
 pub mod ui;
 
@@ -52,6 +55,17 @@ pub struct AppState {
     pub(crate) backend_names: Vec<String>,
     /// Built dashboard bundle, when one is present.
     pub(crate) ui_dir: Option<std::path::PathBuf>,
+    /// Unix time the process built this state: lets the dashboard tell a
+    /// restarted gateway apart from the one it just asked to restart.
+    pub(crate) started_unix: u64,
+}
+
+/// Seconds since the unix epoch, or 0 when the clock is unavailable.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 impl AppState {
@@ -65,6 +79,7 @@ impl AppState {
             registry: None,
             backend_names: Vec::new(),
             ui_dir: None,
+            started_unix: now_unix(),
         }
     }
 
@@ -78,6 +93,7 @@ impl AppState {
             registry: None,
             backend_names: Vec::new(),
             ui_dir: None,
+            started_unix: now_unix(),
         }
     }
 
@@ -123,15 +139,24 @@ pub fn build_router_with_state(state: AppState) -> Router {
         .route("/api/connections/{id}", patch(admin::update_connection))
         .route("/api/usage", get(admin::usage))
         .route("/api/logs", get(admin::logs))
+        .route("/api/keys", get(admin::keys).post(admin::create_key))
+        .route("/api/keys/{id}/revoke", post(admin::revoke_key))
+        .route("/api/keys/{id}/restore", post(admin::restore_key))
+        .route("/api/restart", post(admin::restart_service))
         .route("/", get(ui::serve))
         .route("/{*path}", get(ui::serve))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .layer(axum::middleware::from_fn(cors::cors))
         .with_state(state)
 }
 
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({ "status": "ok", "backend": state.backend.name() }))
+    Json(json!({
+        "status": "ok",
+        "backend": state.backend.name(),
+        "started_unix": state.started_unix,
+    }))
 }
 
 async fn list_models(State(state): State<AppState>, _auth: Authenticated) -> impl IntoResponse {

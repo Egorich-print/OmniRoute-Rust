@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{DbError, Result};
 
@@ -54,7 +54,64 @@ fn applied_versions(conn: &Connection) -> Result<HashSet<String>> {
     Ok(versions)
 }
 
-/// Apply every migration the ledger lacks, oldest first.
+/// Columns the admin API needs on `api_keys` that postdate the 001 base
+/// schema. The JS server adds them through its own migrations; a fresh Rust
+/// database needs them too. All nullable or constant-defaulted, so the
+/// backfill never touches existing rows and never fails where the JS server
+/// already added them.
+const API_KEYS_COMPAT_COLUMNS: &[(&str, &str)] = &[
+    ("key_prefix", "TEXT"),
+    ("revoked_at", "TEXT"),
+    ("expires_at", "TEXT"),
+    ("last_used_at", "TEXT"),
+    ("is_active", "INTEGER NOT NULL DEFAULT 1"),
+    ("is_banned", "INTEGER NOT NULL DEFAULT 0"),
+    ("key_hash", "TEXT"),
+    ("scopes", "TEXT"),
+    ("allowed_combos", "TEXT"),
+    ("stream_default_mode", "TEXT"),
+    ("allowed_quotas", "TEXT"),
+    ("disable_non_public_models", "INTEGER"),
+    ("usage_limit_enabled", "INTEGER"),
+    ("max_sessions", "INTEGER"),
+    ("allow_usage_command", "INTEGER"),
+    ("chaos_mode_enabled", "INTEGER"),
+    ("cache_default_mode", "TEXT"),
+    ("model_access_mode", "TEXT"),
+    ("compression_enabled", "INTEGER"),
+];
+
+/// Add any [`API_KEYS_COMPAT_COLUMNS`] the database lacks.
+///
+/// Runs on every boot (not via the ledger): the JS-owned database already
+/// has these columns, so there is nothing versioned to record — the PRAGMA
+/// check makes the step a no-op there.
+fn ensure_api_keys_columns(conn: &Connection) -> Result<()> {
+    let table: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'api_keys'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(DbError::from)?;
+    if table.is_none() {
+        return Ok(());
+    }
+    let mut statement = conn.prepare("PRAGMA table_info(api_keys)")?;
+    let present: HashSet<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<_, _>>()?;
+    for (column, ddl) in API_KEYS_COMPAT_COLUMNS {
+        if !present.contains(*column) {
+            conn.execute_batch(&format!("ALTER TABLE api_keys ADD COLUMN {column} {ddl}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Apply every migration the ledger lacks, oldest first, then converge
+/// additive columns the admin API needs.
 ///
 /// Returns the versions applied by this call (empty when up to date).
 pub fn migrate(conn: &mut Connection) -> Result<Vec<String>> {
@@ -81,6 +138,7 @@ pub fn migrate(conn: &mut Connection) -> Result<Vec<String>> {
         transaction.commit()?;
         newly_applied.push(migration.version.to_string());
     }
+    ensure_api_keys_columns(conn)?;
     Ok(newly_applied)
 }
 
@@ -112,8 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn preseeded_ledger_skips_base_schema() {
-        let db = Db::open_in_memory().unwrap();
+    fn preseeded_ledger_skips_base_schema() {        let db = Db::open_in_memory().unwrap();
         let mut guard = db.connection();
         ensure_ledger(&guard).unwrap();
         guard
@@ -126,5 +183,64 @@ mod tests {
         // A database the Node server already migrated must not be touched.
         let applied = migrate(&mut guard).unwrap();
         assert!(applied.is_empty());
+    }
+
+    fn api_keys_columns(conn: &rusqlite::Connection) -> HashSet<String> {
+        let mut statement = conn.prepare("PRAGMA table_info(api_keys)").unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn fresh_db_gains_api_keys_compat_columns() {
+        let db = Db::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let guard = db.connection();
+
+        let columns = api_keys_columns(&guard);
+        for column in [
+            "key_prefix",
+            "revoked_at",
+            "expires_at",
+            "last_used_at",
+            "is_active",
+            "is_banned",
+            "key_hash",
+            "scopes",
+        ] {
+            assert!(columns.contains(column), "{column} missing");
+        }
+        // Second boot is a no-op.
+        drop(guard);
+        db.migrate().unwrap();
+    }
+
+    #[test]
+    fn already_extended_db_is_left_alone() {
+        let db = Db::open_in_memory().unwrap();
+        let mut guard = db.connection();
+        migrate(&mut guard).unwrap();
+        guard
+            .execute(
+                "INSERT INTO api_keys (id, name, key, revoked_at, created_at)
+                 VALUES ('k', 'n', 'sk-x', '2026-01-01 00:00:00', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        drop(guard);
+
+        db.migrate().unwrap();
+        let guard = db.connection();
+        let revoked: String = guard
+            .query_row(
+                "SELECT revoked_at FROM api_keys WHERE id = 'k'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revoked, "2026-01-01 00:00:00");
     }
 }

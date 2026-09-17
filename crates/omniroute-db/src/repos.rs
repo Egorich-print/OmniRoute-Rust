@@ -183,6 +183,245 @@ pub fn insert_api_key(conn: &Connection, row: &ApiKeyRow) -> Result<()> {
     Ok(())
 }
 
+/// A dashboard-created API key, mirroring what the JS server stores for an
+/// operator key: plaintext `sk-…` secret (the Rust gateway matches it
+/// verbatim), `key_prefix` for masked display, and `key_hash` (sha256 hex)
+/// for JS-side lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewApiKey {
+    pub id: String,
+    pub name: String,
+    pub key: String,
+    pub key_prefix: String,
+    pub key_hash: String,
+    pub allowed_models: String,
+    pub scopes: String,
+}
+
+/// Insert a full operator key. Unspecified columns take the same defaults the
+/// JS dashboard writes, so the key works on both sides.
+pub fn insert_full_api_key(conn: &Connection, row: &NewApiKey) -> Result<()> {
+    conn.execute(
+        "INSERT INTO api_keys (
+            id, name, key, machine_id, allowed_models, no_log, created_at,
+            revoked_at, expires_at, last_used_at, key_prefix, scopes,
+            allowed_combos, stream_default_mode, allowed_quotas,
+            disable_non_public_models, usage_limit_enabled, is_active,
+            max_sessions, is_banned, key_hash, allow_usage_command,
+            chaos_mode_enabled, cache_default_mode, model_access_mode,
+            compression_enabled
+        ) VALUES (
+            ?1, ?2, ?3, NULL, ?4, 0, datetime('now'),
+            NULL, NULL, NULL, ?5, ?6,
+            '[\"combo/*\"]', 'legacy', '[]',
+            0, 0, 1,
+            0, 0, ?7, 1,
+            0, 'legacy', 'all',
+            1
+        )",
+        params![
+            row.id,
+            row.name,
+            row.key,
+            row.allowed_models,
+            row.key_prefix,
+            row.scopes,
+            row.key_hash,
+        ],
+    )?;
+    Ok(())
+}
+
+/// An API key as the dashboard lists it: metadata only, never the secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeySummary {
+    pub id: String,
+    pub name: String,
+    pub key_prefix: Option<String>,
+    /// Whether the stored secret is `enc:v1:`-encrypted (unusable by the
+    /// Rust gateway, which matches plaintext secrets verbatim).
+    pub is_encrypted: bool,
+    pub created_at: Option<String>,
+    pub revoked_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub last_used_at: Option<String>,
+    pub is_active: bool,
+}
+
+fn map_key_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiKeySummary> {
+    Ok(ApiKeySummary {
+        id: row.get("id")?,
+        name: row.get("name")?,
+        key_prefix: row.get("key_prefix")?,
+        is_encrypted: row.get::<_, i64>("is_encrypted")? != 0,
+        created_at: row.get("created_at")?,
+        revoked_at: row.get("revoked_at")?,
+        expires_at: row.get("expires_at")?,
+        last_used_at: row.get("last_used_at")?,
+        is_active: row.get::<_, Option<i64>>("is_active")?.unwrap_or(1) != 0,
+    })
+}
+
+const KEY_SUMMARY_COLUMNS: &str = "id, name, key_prefix, \
+    CASE WHEN key LIKE 'enc:v1:%' THEN 1 ELSE 0 END AS is_encrypted, \
+    created_at, revoked_at, expires_at, last_used_at, is_active";
+
+/// List every API key, newest first. Secrets are never selected — only a
+/// derived encrypted flag.
+pub fn list_api_keys(conn: &Connection) -> Result<Vec<ApiKeySummary>> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT {KEY_SUMMARY_COLUMNS} FROM api_keys ORDER BY created_at DESC, id ASC"
+    ))?;
+    let rows = statement.query_map([], map_key_summary)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(crate::error::DbError::from)
+}
+
+/// Fetch one key's summary by id. Secrets are never selected.
+pub fn get_api_key_summary(conn: &Connection, id: &str) -> Result<Option<ApiKeySummary>> {
+    let row = conn
+        .query_row(
+            &format!("SELECT {KEY_SUMMARY_COLUMNS} FROM api_keys WHERE id = ?1"),
+            params![id],
+            map_key_summary,
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Revoke (`true`) or restore (`false`) an API key. Returns whether the row
+/// exists. Revocation takes effect immediately: authentication reads the
+/// table on every request.
+pub fn set_api_key_revoked(conn: &Connection, id: &str, revoked: bool) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE api_keys SET revoked_at = CASE WHEN ?1 THEN datetime('now') ELSE NULL END \
+         WHERE id = ?2",
+        params![revoked, id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// An API key that passed every usability gate (the auth hot path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsableKey {
+    pub id: String,
+    pub name: String,
+}
+
+/// Fetch an API key by its secret value, honouring the kill switches.
+///
+/// Unlike [`get_api_key_by_key`], a row only matches when it is not revoked,
+/// not banned, active, and unexpired. Expiry is checked in Rust because the
+/// table mixes SQLite (`"2026-09-17 13:00:00"`) and ISO-8601 spellings.
+pub fn find_usable_api_key(conn: &Connection, key: &str) -> Result<Option<UsableKey>> {
+    let row: Option<(String, String, Option<String>)> = conn
+        .query_row(
+            "SELECT id, name, expires_at FROM api_keys \
+             WHERE key = ?1 AND revoked_at IS NULL \
+               AND COALESCE(is_banned, 0) = 0 AND COALESCE(is_active, 1) = 1",
+            params![key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((id, name, expires_at)) = row else {
+        return Ok(None);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    if timestamp_expired(expires_at.as_deref(), now) {
+        return Ok(None);
+    }
+    Ok(Some(UsableKey { id, name }))
+}
+
+/// Whether an `expires_at` value is already past.
+///
+/// `None` (no expiry) and unparseable values count as valid: a weird string
+/// must never lock the operator out, and real rows come from the picker the
+/// dashboard writes.
+fn timestamp_expired(expires_at: Option<&str>, now_unix: u64) -> bool {
+    let Some(text) = expires_at else {
+        return false;
+    };
+    parse_db_timestamp(text).is_some_and(|expiry| expiry <= now_unix)
+}
+
+/// Parse the two timestamp spellings this database holds — SQLite
+/// `"YYYY-MM-DD HH:MM:SS"` and ISO-8601 (`"...)T...Z"`, offsets, fractions)
+/// — into unix seconds. Returns `None` when the text does not match either.
+fn parse_db_timestamp(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let (date, time) = text.split_once(['T', ' '])?;
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: i64 = date_parts.next()?.parse().ok()?;
+    let day: i64 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Offset suffix: `Z`, `+hh:mm`, `+hhmm`, `+hh`, or nothing (assume UTC —
+    // both writers store UTC).
+    let (clock, offset_secs) = if let Some(stripped) = time.strip_suffix(['Z', 'z']) {
+        (stripped, 0)
+    } else if let Some(at) = time.rfind(['+', '-']) {
+        let (clock, zone) = time.split_at(at);
+        (clock, parse_zone_offset(zone)?)
+    } else {
+        (time, 0)
+    };
+    let mut clock_parts = clock.split(':');
+    let hour: i64 = clock_parts.next()?.parse().ok()?;
+    let minute: i64 = clock_parts.next()?.parse().ok()?;
+    let second: i64 = clock_parts
+        .next()?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()?;
+    if clock_parts.next().is_some()
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    // Days since 1970-01-01 (Howard Hinnant's days_from_civil).
+    let adjusted = if month <= 2 { year - 1 } else { year };
+    let era = adjusted.div_euclid(400);
+    let year_of_era = adjusted.rem_euclid(400);
+    let month_prime = (month + 9).rem_euclid(12);
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era =
+        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146097 + day_of_era - 719468;
+    let stamp = days * 86_400 + hour * 3600 + minute * 60 + second - offset_secs;
+    u64::try_from(stamp).ok()
+}
+
+/// Parse a `Z`/`±hh[:mm]` zone suffix into seconds east of UTC.
+fn parse_zone_offset(zone: &str) -> Option<i64> {
+    let sign = match zone.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits: String = zone[1..].chars().filter(|ch| *ch != ':').collect();
+    let (hours, minutes) = match digits.len() {
+        2 => (digits.parse::<i64>().ok()?, 0),
+        4 => (
+            digits[..2].parse::<i64>().ok()?,
+            digits[2..].parse::<i64>().ok()?,
+        ),
+        _ => return None,
+    };
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some(sign * (hours * 3600 + minutes * 60))
+}
+
 /// A row in `combos`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComboRow {
@@ -729,6 +968,124 @@ mod tests {
         let fetched = get_api_key_by_key(&guard, "sk-test-123").unwrap().unwrap();
         assert_eq!(fetched.id, "k1");
         assert!(get_api_key_by_key(&guard, "sk-nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn timestamps_parse_both_spellings() {
+        assert_eq!(parse_db_timestamp("1970-01-01 00:00:00"), Some(0));
+        assert_eq!(parse_db_timestamp("2026-09-17 13:00:00"), Some(1789650000));
+        assert_eq!(
+            parse_db_timestamp("2000-02-29T12:30:15.123Z"),
+            Some(951827415)
+        );
+        assert_eq!(
+            parse_db_timestamp("2000-02-29T14:30:15+02:00"),
+            Some(951827415)
+        );
+        assert_eq!(parse_db_timestamp("not a date"), None);
+        assert_eq!(parse_db_timestamp("2026-13-01 00:00:00"), None);
+        assert!(!timestamp_expired(None, 1789650000));
+        assert!(!timestamp_expired(Some("garbage"), 1789650000));
+        assert!(!timestamp_expired(
+            Some("2026-09-17 13:00:01"),
+            1789650000
+        ));
+        assert!(timestamp_expired(Some("2026-09-17 13:00:00"), 1789650000));
+    }
+
+    #[test]
+    fn usable_keys_honour_kill_switches() {
+        let db = migrated();
+        let guard = db.connection();
+
+        for (id, key) in [
+            ("good", "sk-good"),
+            ("revoked", "sk-revoked"),
+            ("banned", "sk-banned"),
+            ("inactive", "sk-inactive"),
+            ("expired", "sk-expired"),
+        ] {
+            guard
+                .execute(
+                    "INSERT INTO api_keys (id, name, key, created_at) VALUES (?1, ?2, ?3, datetime('now'))",
+                    rusqlite::params![id, id, key],
+                )
+                .unwrap();
+        }
+        guard
+            .execute(
+                "UPDATE api_keys SET revoked_at = datetime('now') WHERE id = 'revoked'",
+                [],
+            )
+            .unwrap();
+        guard
+            .execute("UPDATE api_keys SET is_banned = 1 WHERE id = 'banned'", [])
+            .unwrap();
+        guard
+            .execute(
+                "UPDATE api_keys SET is_active = 0 WHERE id = 'inactive'",
+                [],
+            )
+            .unwrap();
+        guard
+            .execute(
+                "UPDATE api_keys SET expires_at = '2001-01-01 00:00:00' WHERE id = 'expired'",
+                [],
+            )
+            .unwrap();
+
+        let usable = find_usable_api_key(&guard, "sk-good").unwrap().unwrap();
+        assert_eq!(usable.id, "good");
+        for dead in ["sk-revoked", "sk-banned", "sk-inactive", "sk-expired", "sk-nope"] {
+            assert!(
+                find_usable_api_key(&guard, dead).unwrap().is_none(),
+                "{dead} must not authenticate"
+            );
+        }
+    }
+
+    #[test]
+    fn full_keys_insert_list_revoke_restore() {
+        let db = migrated();
+        let guard = db.connection();
+
+        insert_full_api_key(
+            &guard,
+            &NewApiKey {
+                id: "full-1".to_string(),
+                name: "ops".to_string(),
+                key: "sk-abc123".to_string(),
+                key_prefix: "sk-abc123".to_string(),
+                key_hash: "deadbeef".to_string(),
+                allowed_models: "[]".to_string(),
+                scopes: "[\"manage\"]".to_string(),
+            },
+        )
+        .unwrap();
+
+        let listed = list_api_keys(&guard).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "ops");
+        assert!(!listed[0].is_encrypted);
+        assert!(find_usable_api_key(&guard, "sk-abc123").unwrap().is_some());
+
+        assert!(set_api_key_revoked(&guard, "full-1", true).unwrap());
+        assert!(
+            find_usable_api_key(&guard, "sk-abc123")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            get_api_key_summary(&guard, "full-1")
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_some()
+        );
+
+        assert!(set_api_key_revoked(&guard, "full-1", false).unwrap());
+        assert!(find_usable_api_key(&guard, "sk-abc123").unwrap().is_some());
+        assert!(!set_api_key_revoked(&guard, "missing", true).unwrap());
     }
 
     #[test]

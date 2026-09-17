@@ -3,6 +3,7 @@
   import Overview from "./views/Overview.svelte";
   import Combos from "./views/Combos.svelte";
   import Providers from "./views/Providers.svelte";
+  import Keys from "./views/Keys.svelte";
   import Usage from "./views/Usage.svelte";
   import Logs from "./views/Logs.svelte";
   import Playground from "./views/Playground.svelte";
@@ -11,6 +12,7 @@
     ["overview", "Overview", Overview],
     ["combos", "Combos", Combos],
     ["providers", "Providers", Providers],
+    ["keys", "Keys", Keys],
     ["usage", "Usage", Usage],
     ["logs", "Logs", Logs],
     ["playground", "Playground", Playground],

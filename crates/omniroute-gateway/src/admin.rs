@@ -2,13 +2,14 @@
 //!
 //! Serves what the JS dashboard showed, over the same SQLite the gateway
 //! already uses: which providers are live, how combos resolve, recent usage
-//! and recent calls. Secrets are never serialised — only whether a credential
-//! exists.
+//! and recent calls, and the API keys that guard it all. Secrets are never
+//! serialised — list endpoints expose only prefixes — except at creation,
+//! when the new secret is returned exactly once.
 //!
-//! Mutations stay deliberately small: renaming / reordering / hiding combos
-//! and toggling connection activity or priority. Credential rotation is not
-//! exposed here; it stays a JS-dashboard/CLI operation until the Rust side
-//! owns decryption.
+//! Mutations stay deliberately small: combo metadata and contents,
+//! connection activity/priority, and key issuance/revocation. Credential
+//! rotation for providers is not exposed here; it stays a JS-dashboard/CLI
+//! operation until the Rust side owns decryption.
 
 use axum::{
     Json,
@@ -21,8 +22,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::apikeys;
 use crate::auth::Authenticated;
 use crate::combos::{dispatch_backend, parse_combo_rich};
+use crate::restart;
 
 /// Query for the time-ranged endpoints.
 #[derive(Debug, Deserialize)]
@@ -184,6 +187,220 @@ pub async fn connections(State(state): State<AppState>, _auth: Authenticated) ->
         .collect();
 
     Json(json!({ "connections": connections }))
+}
+
+/// `GET /api/keys` — every API key, secrets masked to their prefix.
+///
+/// Encrypted (`enc:v1:`) rows are listed honestly as unusable by this
+/// gateway, which matches plaintext secrets verbatim.
+pub async fn keys(State(state): State<AppState>, _auth: Authenticated) -> Json<Value> {
+    let Some(db) = state.db.as_ref() else {
+        return Json(json!({ "keys": [] }));
+    };
+    let guard = db.connection();
+    let rows = match repos::list_api_keys(&guard) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return Json(json!({ "error": error.to_string(), "keys": [] }));
+        }
+    };
+    let keys: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "name": row.name,
+                "prefix": row.key_prefix,
+                "encrypted": row.is_encrypted,
+                "created_at": row.created_at,
+                "revoked_at": row.revoked_at,
+                "expires_at": row.expires_at,
+                "last_used_at": row.last_used_at,
+                "is_active": row.is_active,
+                "revoked": row.revoked_at.is_some(),
+            })
+        })
+        .collect();
+    Json(json!({ "keys": keys }))
+}
+
+/// Body for `POST /api/keys`.
+#[derive(Debug, Deserialize)]
+pub struct CreateKeyBody {
+    pub name: Option<String>,
+}
+
+/// `POST /api/keys` — issue an operator key.
+///
+/// Mirrors the JS dashboard's key shape (`sk-` + 32 hex, prefix, sha256
+/// hash, manage scope) so the key works on both sides. The full secret is
+/// returned exactly once; list endpoints never expose it.
+pub async fn create_key(
+    State(state): State<AppState>,
+    _auth: Authenticated,
+    Json(body): Json<CreateKeyBody>,
+) -> impl IntoResponse {
+    let name = body.name.unwrap_or_default().trim().to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "name must not be empty" })),
+        );
+    }
+    if name.len() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "name must be at most 64 characters" })),
+        );
+    }
+    let Some(db) = state.db.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "database not configured" })),
+        );
+    };
+    let guard = db.connection();
+    // Paranoia retries on id/secret collision; 128 bits do not collide twice.
+    for _ in 0..3 {
+        let generated = match apikeys::generate() {
+            Ok(generated) => generated,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("randomness failed: {error}") })),
+                );
+            }
+        };
+        let row = repos::NewApiKey {
+            id: generated.id.clone(),
+            name: name.clone(),
+            key: generated.secret.clone(),
+            key_prefix: generated.prefix.clone(),
+            key_hash: generated.hash.clone(),
+            allowed_models: "[]".to_string(),
+            scopes: "[\"manage\",\"self:usage\",\"self:account-quota\"]".to_string(),
+        };
+        match repos::insert_full_api_key(&guard, &row) {
+            Ok(()) => {
+                return (
+                    StatusCode::CREATED,
+                    Json(json!({
+                        "status": "ok",
+                        "id": generated.id,
+                        "name": name,
+                        "key": generated.secret,
+                        "prefix": generated.prefix,
+                        "warning": "Copy the key now — the gateway never shows it again.",
+                    })),
+                );
+            }
+            Err(error) if is_unique_violation(&error) => continue,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": error.to_string() })),
+                );
+            }
+        }
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "could not issue a unique key" })),
+    )
+}
+
+/// `POST /api/keys/:id/revoke` — revoke a key.
+///
+/// Takes effect immediately: authentication reads the table on every
+/// request. Idempotent.
+pub async fn revoke_key(
+    State(state): State<AppState>,
+    _auth: Authenticated,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    set_key_revoked(state, &id, true).await
+}
+
+/// `POST /api/keys/:id/restore` — un-revoke a key. Idempotent.
+pub async fn restore_key(
+    State(state): State<AppState>,
+    _auth: Authenticated,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    set_key_revoked(state, &id, false).await
+}
+
+async fn set_key_revoked(
+    state: AppState,
+    id: &str,
+    revoked: bool,
+) -> (StatusCode, Json<Value>) {
+    let Some(db) = state.db.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "database not configured" })),
+        );
+    };
+    let guard = db.connection();
+    match repos::set_api_key_revoked(&guard, id, revoked) {
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "api key not found" })),
+        ),
+        Ok(true) => {
+            let revoked_at = repos::get_api_key_summary(&guard, id)
+                .ok()
+                .flatten()
+                .and_then(|row| row.revoked_at);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "ok",
+                    "id": id,
+                    "revoked": revoked,
+                    "revoked_at": revoked_at,
+                })),
+            )
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error.to_string() })),
+        ),
+    }
+}
+
+/// `POST /api/restart` — restart the supervised gateway.
+///
+/// The dashboard offers this after connection activity changes, which only
+/// take effect on restart. Succeeds only when launchd supervises us
+/// (`OMNIROUTE_SERVICE_LABEL`, default `com.omniroute.rust`): elsewhere it
+/// answers 409 so a dev-process operator never kills their own shell by
+/// accident. The restart re-execs the same binary ~2s after the 202, so
+/// in-flight requests are dropped — call it from a quiet moment.
+pub async fn restart_service(_auth: Authenticated) -> impl IntoResponse {
+    let label = restart::service_label();
+    let Some(uid) = restart::current_uid() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "cannot determine current user" })),
+        );
+    };
+    if !restart::is_supervised(&label, &uid) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "gateway is not supervised by launchd; restart it yourself" })),
+        );
+    }
+    match restart::request_restart(&label, &uid) {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "status": "restarting", "label": label })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error.to_string() })),
+        ),
+    }
 }
 
 /// `GET /api/usage?days=7&limit=10` — totals plus top providers and models.

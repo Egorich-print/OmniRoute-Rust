@@ -1,5 +1,5 @@
 <script>
-  import { getJson, patchJson } from "../api.js";
+  import { apiBase, getJson, patchJson, postJson } from "../api.js";
 
   let { key } = $props();
   let connections = $state(null);
@@ -7,6 +7,8 @@
   let notice = $state("");
   let onlyProblems = $state(false);
   let savingId = $state(null);
+  let restartPending = $state(false);
+  let restarting = $state(false);
 
   async function load() {
     try {
@@ -30,6 +32,7 @@
     try {
       const updated = await patchJson(`/api/connections/${row.id}`, key, patch);
       if (updated.restart_required) {
+        restartPending = true;
         notice =
           "Saved. Connection activity changed — restart the gateway to apply it (backends are built at startup).";
       } else {
@@ -40,6 +43,35 @@
       error = err.message;
     } finally {
       savingId = null;
+    }
+  }
+
+  async function restartNow() {
+    restarting = true;
+    error = "";
+    try {
+      const before = await fetch(`${apiBase()}/healthz`).then((res) => res.json());
+      await postJson("/api/restart", key, {});
+      notice = "Restart requested — waiting for the gateway to come back…";
+      for (let i = 0; i < 30; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        try {
+          const health = await fetch(`${apiBase()}/healthz`).then((res) => res.json());
+          if (health.status === "ok" && health.started_unix !== before.started_unix) {
+            notice = "Gateway restarted and serving.";
+            restartPending = false;
+            await load();
+            return;
+          }
+        } catch {
+          /* still down — keep waiting */
+        }
+      }
+      error = "Gateway did not come back within a minute — check the service.";
+    } catch (err) {
+      error = err.message;
+    } finally {
+      restarting = false;
     }
   }
 
@@ -68,7 +100,18 @@
 </p>
 
 {#if error}<div class="error">{error}</div>{/if}
-{#if notice}<div class="notice">{notice}</div>{/if}
+{#if notice}
+  <div class="notice">
+    {notice}
+    {#if restartPending}
+      <div class="toolbar" style="margin:10px 0 0">
+        <button class="primary" disabled={restarting} onclick={restartNow}>
+          {restarting ? "restarting…" : "Restart now"}
+        </button>
+      </div>
+    {/if}
+  </div>
+{/if}
 
 <div class="toolbar">
   <label><input type="checkbox" bind:checked={onlyProblems} /> only problems</label>

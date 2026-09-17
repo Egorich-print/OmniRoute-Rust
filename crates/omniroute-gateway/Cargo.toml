@@ -17,6 +17,9 @@ omniroute-translate = { workspace = true }
 omniroute-usage = { workspace = true }
 axum = { workspace = true }
 rusqlite = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 serde = { workspace = true }

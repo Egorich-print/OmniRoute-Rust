@@ -58,13 +58,14 @@ impl FromRequestParts<AppState> for Authenticated {
         let Some(token) = bearer_token(parts) else {
             return Err(unauthorized("missing bearer token"));
         };
-        match omniroute_db::repos::get_api_key_by_key(&guard, &token).unwrap_or(None) {
+        match omniroute_db::repos::find_usable_api_key(&guard, &token).unwrap_or(None) {
             Some(row) => Ok(Self {
                 key: Some(AuthKey {
                     id: row.id,
                     name: row.name,
                 }),
             }),
+            // Unknown, revoked, banned, deactivated or expired.
             None => Err(unauthorized("invalid api key")),
         }
     }
@@ -149,9 +150,27 @@ mod tests {
     fn keyed_db_lookup_finds_inserted_key() {
         let db = keyed_db();
         let guard = db.connection();
-        let row = omniroute_db::repos::get_api_key_by_key(&guard, "sk-test-123")
+        let row = omniroute_db::repos::find_usable_api_key(&guard, "sk-test-123")
             .unwrap()
             .unwrap();
         assert_eq!(row.id, "k1");
+    }
+
+    #[test]
+    fn revoked_key_stops_authenticating() {
+        let db = keyed_db();
+        db.migrate().unwrap();
+        let guard = db.connection();
+        assert!(
+            omniroute_db::repos::find_usable_api_key(&guard, "sk-test-123")
+                .unwrap()
+                .is_some()
+        );
+        omniroute_db::repos::set_api_key_revoked(&guard, "k1", true).unwrap();
+        assert!(
+            omniroute_db::repos::find_usable_api_key(&guard, "sk-test-123")
+                .unwrap()
+                .is_none()
+        );
     }
 }
