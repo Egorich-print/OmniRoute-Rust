@@ -1,28 +1,47 @@
 <script>
-  import { getJson } from "../api.js";
+  import { getJson, patchJson } from "../api.js";
 
   let { key } = $props();
   let connections = $state(null);
   let error = $state("");
+  let notice = $state("");
   let onlyProblems = $state(false);
+  let savingId = $state(null);
+
+  async function load() {
+    try {
+      const payload = await getJson("/api/connections", key);
+      connections = payload.connections;
+      error = payload.connection_error ?? "";
+    } catch (err) {
+      error = err.message;
+    }
+  }
 
   $effect(() => {
     if (!key) return;
-    let cancelled = false;
-    getJson("/api/connections", key)
-      .then((payload) => {
-        if (!cancelled) {
-          connections = payload.connections;
-          error = payload.connection_error ?? "";
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) error = err.message;
-      });
-    return () => {
-      cancelled = true;
-    };
+    load();
   });
+
+  async function save(row, patch) {
+    savingId = row.id;
+    error = "";
+    notice = "";
+    try {
+      const updated = await patchJson(`/api/connections/${row.id}`, key, patch);
+      if (updated.restart_required) {
+        notice =
+          "Saved. Connection activity changed — restart the gateway to apply it (backends are built at startup).";
+      } else {
+        notice = "Saved.";
+      }
+      await load();
+    } catch (err) {
+      error = err.message;
+    } finally {
+      savingId = null;
+    }
+  }
 
   const shown = $derived(
     (connections ?? []).filter((row) => {
@@ -45,9 +64,11 @@
 <p class="sub">
   Connections from the shared database. <strong>servable</strong> means a backend is built for that
   provider, which requires an active row with a credential and an executor for its format.
+  Toggling activity needs a gateway restart; priority and name apply on the next read.
 </p>
 
 {#if error}<div class="error">{error}</div>{/if}
+{#if notice}<div class="notice">{notice}</div>{/if}
 
 <div class="toolbar">
   <label><input type="checkbox" bind:checked={onlyProblems} /> only problems</label>
@@ -58,7 +79,7 @@
     <thead>
       <tr>
         <th>provider</th><th>name</th><th>auth</th><th>credential</th>
-        <th>active</th><th>servable</th><th>expires</th><th>last error</th>
+        <th>active</th><th>priority</th><th>servable</th><th>expires</th><th>last error</th>
       </tr>
     </thead>
     <tbody>
@@ -75,8 +96,26 @@
             {/if}
           </td>
           <td>
-            {#if row.is_active}<span class="tag ok">yes</span>
-            {:else}<span class="tag">no</span>{/if}
+            <button
+              disabled={savingId === row.id}
+              title={row.is_active ? "Deactivate (needs restart)" : "Activate (needs restart)"}
+              onclick={() => save(row, { is_active: !row.is_active })}
+            >
+              {#if row.is_active}on{:else}off{/if}
+            </button>
+          </td>
+          <td class="mono">
+            <button
+              disabled={savingId === row.id}
+              title="Lower priority"
+              onclick={() => save(row, { priority: row.priority - 1 })}
+            >−</button>
+            {row.priority}
+            <button
+              disabled={savingId === row.id}
+              title="Raise priority"
+              onclick={() => save(row, { priority: row.priority + 1 })}
+            >+</button>
           </td>
           <td>
             {#if row.servable}<span class="tag ok">yes</span>

@@ -249,6 +249,87 @@ pub fn upsert_combo(conn: &Connection, row: &ComboRow) -> Result<()> {
     Ok(())
 }
 
+/// Fields that `PATCH /api/combos/:id` may change.
+///
+/// `name` and `sort_order` live both as columns and inside the `data` JSON;
+/// this patch keeps the two copies in sync.
+#[derive(Debug, Clone, Default)]
+pub struct ComboMetaPatch {
+    pub name: Option<String>,
+    pub sort_order: Option<i64>,
+    pub is_hidden: Option<bool>,
+}
+
+/// Update combo metadata, keeping the `data` JSON (`name`, `sortOrder`,
+/// `isHidden`) in sync with the columns.
+///
+/// Returns the updated row, or `None` when `id` does not exist. A duplicate
+/// `name` surfaces as a SQLite unique-constraint error for the caller to map.
+pub fn update_combo_meta(
+    conn: &Connection,
+    id: &str,
+    patch: &ComboMetaPatch,
+) -> Result<Option<ComboRow>> {
+    let Some(current) = get_combo(conn, id)? else {
+        return Ok(None);
+    };
+    let mut data: serde_json::Value =
+        serde_json::from_str(&current.data).unwrap_or(serde_json::json!({}));
+    if !data.is_object() {
+        data = serde_json::json!({});
+    }
+    let name = patch.name.clone().unwrap_or(current.name);
+    let sort_order = patch.sort_order.unwrap_or(current.sort_order);
+    if let Some(hidden) = patch.is_hidden {
+        data["isHidden"] = serde_json::Value::Bool(hidden);
+    }
+    data["name"] = serde_json::Value::String(name.clone());
+    data["sortOrder"] = serde_json::Value::from(sort_order);
+    let data_text = serde_json::to_string(&data)?;
+    conn.execute(
+        "UPDATE combos SET name = ?1, data = ?2, sort_order = ?3, \
+         updated_at = datetime('now') WHERE id = ?4",
+        params![name, data_text, sort_order, id],
+    )?;
+    get_combo(conn, id)
+}
+
+/// Fields that `PATCH /api/connections/:id` may change.
+///
+/// Secrets are deliberately not patchable here; credential rotation stays a
+/// JS-dashboard/CLI operation until the Rust side owns decryption.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectionMetaPatch {
+    pub name: Option<String>,
+    pub is_active: Option<bool>,
+    pub priority: Option<i64>,
+}
+
+/// Update connection metadata. Returns the updated row, or `None` when `id`
+/// does not exist.
+///
+/// Note: flipping `is_active` only takes effect on the live gateway after a
+/// restart, because backends are built once at startup. Callers should tell
+/// the user that.
+pub fn update_connection_meta(
+    conn: &Connection,
+    id: &str,
+    patch: &ConnectionMetaPatch,
+) -> Result<Option<ConnectionRow>> {
+    let Some(current) = get_connection(conn, id)? else {
+        return Ok(None);
+    };
+    let name = patch.name.clone().or(current.name);
+    let is_active = patch.is_active.unwrap_or(current.is_active);
+    let priority = patch.priority.unwrap_or(current.priority);
+    conn.execute(
+        "UPDATE provider_connections SET name = ?1, is_active = ?2, priority = ?3, \
+         updated_at = datetime('now') WHERE id = ?4",
+        params![name, i64::from(is_active), priority, id],
+    )?;
+    get_connection(conn, id)
+}
+
 /// Read a `key_value` setting.
 pub fn kv_get(conn: &Connection, namespace: &str, key: &str) -> Result<Option<String>> {
     let value: Option<String> = conn
@@ -563,6 +644,91 @@ mod tests {
             "b"
         );
         assert_eq!(get_combo(&guard, "a").unwrap().unwrap().name, "a-combo");
+    }
+
+    #[test]
+    fn combo_meta_patch_keeps_json_in_sync() {
+        let db = migrated();
+        let guard = db.connection();
+
+        upsert_combo(
+            &guard,
+            &ComboRow {
+                id: "c1".to_string(),
+                name: "alpha".to_string(),
+                data: r#"{"name":"alpha","sortOrder":1,"isHidden":false,"models":[]}"#
+                    .to_string(),
+                sort_order: 1,
+            },
+        )
+        .unwrap();
+
+        let updated = update_combo_meta(
+            &guard,
+            "c1",
+            &ComboMetaPatch {
+                sort_order: Some(9),
+                is_hidden: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .expect("row exists");
+        assert_eq!(updated.sort_order, 9);
+        assert_eq!(updated.name, "alpha");
+        let data: serde_json::Value = serde_json::from_str(&updated.data).unwrap();
+        assert_eq!(data["sortOrder"], serde_json::json!(9));
+        assert_eq!(data["isHidden"], serde_json::json!(true));
+        assert_eq!(data["name"], serde_json::json!("alpha"));
+
+        let renamed = update_combo_meta(
+            &guard,
+            "c1",
+            &ComboMetaPatch {
+                name: Some("beta".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .expect("row exists");
+        assert_eq!(renamed.name, "beta");
+        let data: serde_json::Value = serde_json::from_str(&renamed.data).unwrap();
+        assert_eq!(data["name"], serde_json::json!("beta"));
+        // Untouched fields survive.
+        assert_eq!(data["sortOrder"], serde_json::json!(9));
+
+        assert!(get_combo_by_name(&guard, "beta").unwrap().is_some());
+        assert!(update_combo_meta(&guard, "missing", &ComboMetaPatch::default())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn connection_meta_patch_toggles_active() {
+        let db = migrated();
+        let guard = db.connection();
+
+        upsert_connection(&guard, &sample_connection("c1")).unwrap();
+
+        let updated = update_connection_meta(
+            &guard,
+            "c1",
+            &ConnectionMetaPatch {
+                is_active: Some(false),
+                priority: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .expect("row exists");
+        assert!(!updated.is_active);
+        assert_eq!(updated.priority, 3);
+        // Untouched columns survive.
+        assert_eq!(updated.provider, "grok-cli");
+
+        assert!(update_connection_meta(&guard, "missing", &ConnectionMetaPatch::default())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

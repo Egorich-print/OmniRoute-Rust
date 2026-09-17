@@ -205,6 +205,15 @@ code,
   margin-bottom: 14px;
 }
 
+.notice {
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ok) 40%, transparent);
+  color: #c9f0d4;
+  padding: 9px 12px;
+  border-radius: 8px;
+  margin-bottom: 14px;
+}
+
 .toolbar {
   display: flex;
   gap: 8px;

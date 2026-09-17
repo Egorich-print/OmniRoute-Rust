@@ -30,7 +30,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use futures::StreamExt;
 use omniroute_core::{ChatCompletionRequest, GatewayError, StreamChunk};
@@ -118,7 +118,9 @@ pub fn build_router_with_state(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/api/overview", get(admin::overview))
         .route("/api/combos", get(admin::combos))
+        .route("/api/combos/{id}", patch(admin::update_combo))
         .route("/api/connections", get(admin::connections))
+        .route("/api/connections/{id}", patch(admin::update_connection))
         .route("/api/usage", get(admin::usage))
         .route("/api/logs", get(admin::logs))
         .route("/", get(ui::serve))

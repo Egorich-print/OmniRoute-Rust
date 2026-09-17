@@ -1,14 +1,20 @@
-//! Read-only admin API backing the dashboard.
+//! Admin API backing the dashboard.
 //!
 //! Serves what the JS dashboard showed, over the same SQLite the gateway
 //! already uses: which providers are live, how combos resolve, recent usage
 //! and recent calls. Secrets are never serialised — only whether a credential
-//! exists. Mutations (editing combos, keys, providers) are out of scope for
-//! this first contour.
+//! exists.
+//!
+//! Mutations stay deliberately small: renaming / reordering / hiding combos
+//! and toggling connection activity or priority. Credential rotation is not
+//! exposed here; it stays a JS-dashboard/CLI operation until the Rust side
+//! owns decryption.
 
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
 };
 use omniroute_db::repos;
 use serde::Deserialize;
@@ -113,8 +119,11 @@ pub async fn combos(State(state): State<AppState>, _auth: Authenticated) -> Json
                 })
                 .unwrap_or_default();
             out.push(json!({
+                "id": row.id,
                 "name": row.name,
                 "strategy": combo.map(|combo| combo.strategy.clone()).unwrap_or_default(),
+                "sort_order": row.sort_order,
+                "is_hidden": is_hidden(&row.data),
                 "servable_entries": entries.iter().filter(|entry| entry["servable"] == json!(true)).count(),
                 "total_entries": entries.len(),
                 "entries": entries,
@@ -257,4 +266,158 @@ pub async fn logs(
         .collect();
 
     Json(json!({ "logs": logs }))
+}
+
+/// Read the `isHidden` flag out of a combo `data` blob.
+///
+/// A corrupt or non-object blob counts as visible: hiding must be explicit.
+fn is_hidden(data: &str) -> bool {
+    serde_json::from_str::<Value>(data)
+        .ok()
+        .and_then(|value| value.get("isHidden")?.as_bool())
+        .unwrap_or(false)
+}
+
+/// Body for `PATCH /api/combos/:id`. Every field is optional; absent fields
+/// are left untouched.
+#[derive(Debug, Deserialize)]
+pub struct UpdateComboBody {
+    pub name: Option<String>,
+    pub sort_order: Option<i64>,
+    pub is_hidden: Option<bool>,
+}
+
+/// Body for `PATCH /api/connections/:id`. Every field is optional; absent
+/// fields are left untouched.
+#[derive(Debug, Deserialize)]
+pub struct UpdateConnectionBody {
+    pub name: Option<String>,
+    pub is_active: Option<bool>,
+    pub priority: Option<i64>,
+}
+
+/// A SQLite unique-constraint failure (duplicate combo name on rename).
+fn is_unique_violation(error: &omniroute_db::DbError) -> bool {
+    error.to_string().contains("UNIQUE constraint failed")
+}
+
+/// `PATCH /api/combos/:id` — rename, reorder or hide a combo.
+///
+/// Combo routing reads the database on every request, so the change takes
+/// effect immediately. `404` when `id` is unknown, `409` when `name` collides
+/// with another combo, `400` when the body carries nothing usable.
+pub async fn update_combo(
+    State(state): State<AppState>,
+    _auth: Authenticated,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateComboBody>,
+) -> impl IntoResponse {
+    if let Some(name) = body.name.as_deref()
+        && name.trim().is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "name must not be empty" })),
+        );
+    }
+    let patch = repos::ComboMetaPatch {
+        name: body.name.map(|name| name.trim().to_string()),
+        sort_order: body.sort_order,
+        is_hidden: body.is_hidden,
+    };
+    if patch.name.is_none() && patch.sort_order.is_none() && patch.is_hidden.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no fields to update" })),
+        );
+    }
+    let Some(db) = state.db.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "database not configured" })),
+        );
+    };
+    let guard = db.connection();
+    match repos::update_combo_meta(&guard, &id, &patch) {
+        Ok(Some(row)) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "id": row.id,
+                "name": row.name,
+                "sort_order": row.sort_order,
+                "is_hidden": is_hidden(&row.data),
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "combo not found" })),
+        ),
+        Err(error) if is_unique_violation(&error) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "another combo already uses that name" })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error.to_string() })),
+        ),
+    }
+}
+
+/// `PATCH /api/connections/:id` — rename, toggle or reprioritise a provider
+/// connection.
+///
+/// `restart_required` is true when `is_active` flipped: backends are built
+/// once at startup, so the live gateway only picks the change up on restart.
+pub async fn update_connection(
+    State(state): State<AppState>,
+    _auth: Authenticated,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateConnectionBody>,
+) -> impl IntoResponse {
+    if body.name.is_none() && body.is_active.is_none() && body.priority.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no fields to update" })),
+        );
+    }
+    let Some(db) = state.db.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "database not configured" })),
+        );
+    };
+    let guard = db.connection();
+    let previously_active = repos::get_connection(&guard, &id)
+        .ok()
+        .flatten()
+        .map(|row| row.is_active);
+    let patch = repos::ConnectionMetaPatch {
+        name: body.name,
+        is_active: body.is_active,
+        priority: body.priority,
+    };
+    match repos::update_connection_meta(&guard, &id, &patch) {
+        Ok(Some(row)) => {
+            let restart_required = previously_active.is_some_and(|active| active != row.is_active);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "ok",
+                    "id": row.id,
+                    "is_active": row.is_active,
+                    "priority": row.priority,
+                    "restart_required": restart_required,
+                })),
+            )
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "connection not found" })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error.to_string() })),
+        ),
+    }
 }

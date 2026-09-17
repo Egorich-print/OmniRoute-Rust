@@ -53,3 +53,10 @@ export const postJson = (path, key, body) =>
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+
+export const patchJson = (path, key, body) =>
+  request(path, key, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
