@@ -38,10 +38,14 @@ pub struct GeminiBackend {
 /// The signature leaves in `extra_content` for clients that preserve unknown
 /// fields. Clients that rebuild the assistant message from their own schema
 /// drop it, and Gemini then rejects the replayed `functionCall`, so the id we
-/// minted is used as a fallback key. Bounded: the oldest entries fall out
-/// first, and a lost signature only costs one degraded call.
+/// minted is used as a fallback key.
+///
+/// The store is persisted: an agent conversation outlives a gateway restart,
+/// and a signature lost that way turns the next turn into a hard 400.
+/// Bounded: the oldest entries fall out first.
 #[derive(Debug, Default)]
-struct ThoughtSignatures {
+pub struct ThoughtSignatures {
+    path: Option<std::path::PathBuf>,
     state: std::sync::Mutex<SignatureState>,
 }
 
@@ -51,33 +55,132 @@ struct SignatureState {
     values: std::collections::HashMap<String, String>,
 }
 
+/// One persisted `id` → `signature` pair.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SignatureRecord {
+    id: String,
+    signature: String,
+}
+
 /// Signatures kept before the oldest are evicted.
 const SIGNATURE_CAPACITY: usize = 4096;
 
 impl ThoughtSignatures {
-    fn record(&self, id: &str, signature: &str) {
-        let Ok(mut state) = self.state.lock() else {
+    /// Open a persistent store, reusing signatures recorded before a restart.
+    pub fn open(path: std::path::PathBuf) -> Self {
+        let store = Self {
+            path: Some(path),
+            state: std::sync::Mutex::new(SignatureState::default()),
+        };
+        store.load();
+        store
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SignatureState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Read the persisted pairs back, then rewrite the file trimmed so it does
+    /// not grow without bound across restarts.
+    fn load(&self) {
+        let Some(path) = self.path.as_ref() else {
             return;
         };
-        if state
-            .values
-            .insert(id.to_string(), signature.to_string())
-            .is_none()
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
         {
-            state.order.push_back(id.to_string());
-        }
-        while state.order.len() > SIGNATURE_CAPACITY {
-            if let Some(oldest) = state.order.pop_front() {
-                state.values.remove(&oldest);
+            let mut state = self.lock();
+            for line in content.lines() {
+                let Ok(record) = serde_json::from_str::<SignatureRecord>(line) else {
+                    continue;
+                };
+                if record.id.is_empty() || record.signature.is_empty() {
+                    continue;
+                }
+                if state
+                    .values
+                    .insert(record.id.clone(), record.signature)
+                    .is_none()
+                {
+                    state.order.push_back(record.id);
+                }
             }
+            while state.order.len() > SIGNATURE_CAPACITY {
+                if let Some(oldest) = state.order.pop_front() {
+                    state.values.remove(&oldest);
+                }
+            }
+        }
+        self.rewrite();
+    }
+
+    /// Replace the file with the in-memory contents (used once at load).
+    fn rewrite(&self) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        let state = self.lock();
+        let mut body = String::new();
+        for id in &state.order {
+            let Some(signature) = state.values.get(id) else {
+                continue;
+            };
+            if let Ok(line) = serde_json::to_string(&SignatureRecord {
+                id: id.clone(),
+                signature: signature.clone(),
+            }) {
+                body.push_str(&line);
+                body.push('\n');
+            }
+        }
+        let _ = std::fs::write(path, body);
+    }
+
+    fn record(&self, id: &str, signature: &str) {
+        {
+            let mut state = self.lock();
+            if state
+                .values
+                .insert(id.to_string(), signature.to_string())
+                .is_none()
+            {
+                state.order.push_back(id.to_string());
+            }
+            while state.order.len() > SIGNATURE_CAPACITY {
+                if let Some(oldest) = state.order.pop_front() {
+                    state.values.remove(&oldest);
+                }
+            }
+        }
+        self.append(id, signature);
+    }
+
+    /// Append one pair; a failed write only costs the fallback for that call.
+    fn append(&self, id: &str, signature: &str) {
+        use std::io::Write;
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        let Ok(line) = serde_json::to_string(&SignatureRecord {
+            id: id.to_string(),
+            signature: signature.to_string(),
+        }) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "{line}");
         }
     }
 
     fn get(&self, id: &str) -> Option<String> {
-        self.state
-            .lock()
-            .ok()
-            .and_then(|state| state.values.get(id).cloned())
+        self.lock().values.get(id).cloned()
     }
 }
 
@@ -138,6 +241,22 @@ impl GeminiBackend {
         base_url: String,
         tokens: Vec<String>,
     ) -> Result<Self, omniroute_http::client::HttpError> {
+        Self::with_signature_store(
+            base_url,
+            tokens,
+            std::sync::Arc::new(ThoughtSignatures::default()),
+        )
+    }
+
+    /// Build with a persistent thought-signature store.
+    ///
+    /// Agents span longer than a process: a signature dropped by a restart
+    /// makes Gemini reject the next replayed function call.
+    pub fn with_signature_store(
+        base_url: String,
+        tokens: Vec<String>,
+        signatures: std::sync::Arc<ThoughtSignatures>,
+    ) -> Result<Self, omniroute_http::client::HttpError> {
         if tokens.is_empty() {
             return Err(omniroute_http::client::HttpError::Status {
                 status: 0,
@@ -149,7 +268,7 @@ impl GeminiBackend {
             base_url: base_url.trim_end_matches('/').to_string(),
             tokens,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            signatures: std::sync::Arc::new(ThoughtSignatures::default()),
+            signatures,
         })
     }
 
@@ -458,6 +577,28 @@ mod tests {
 
         let response = backend.complete(request).await.unwrap();
         assert_eq!(response.choices[0].message.text(), "{}");
+    }
+
+    #[test]
+    fn thought_signatures_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("omni-sig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("signatures.jsonl");
+
+        let first = ThoughtSignatures::open(path.clone());
+        first.record("chatcmpl-1-0", "c2ln");
+        drop(first);
+
+        // A new process opens the same file: the conversation keeps working.
+        let second = ThoughtSignatures::open(path.clone());
+        assert_eq!(second.get("chatcmpl-1-0").as_deref(), Some("c2ln"));
+
+        // Loading trims the file back to the retained pairs.
+        let reloaded = ThoughtSignatures::open(path.clone());
+        assert_eq!(reloaded.get("chatcmpl-1-0").as_deref(), Some("c2ln"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ pub mod gemini;
 pub mod grok_cli;
 pub mod ids;
 pub mod openai;
+pub mod responses;
 pub mod routing;
 
 use std::convert::Infallible;

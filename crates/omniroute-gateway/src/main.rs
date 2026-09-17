@@ -11,9 +11,10 @@ use omniroute_gateway::{
     backend::EchoBackend,
     build_router_with_state,
     credentials::{active_providers, load_credentials},
-    gemini::GeminiBackend,
+    gemini::{GeminiBackend, ThoughtSignatures},
     grok_cli::GrokCliBackend,
     openai::{OpenAiBackend, ProviderOpenAiBackend, resolve_chat_url},
+    responses::ResponsesBackend,
     routing::RoutingBackend,
 };
 use omniroute_providers::ProviderRegistry;
@@ -93,6 +94,11 @@ fn select_backend(
     // Per-provider OpenAI-compatible backends from the registry + database.
     let crypto = load_secret(Some(data_dir)).and_then(|secret| FieldCrypto::from_secret(&secret));
     let registry = Arc::new(ProviderRegistry::load());
+    // Thought signatures must outlive a restart, or the next turn of an
+    // in-flight agent conversation is rejected upstream.
+    let signatures = Arc::new(ThoughtSignatures::open(
+        data_dir.join("gemini-thought-signatures.jsonl"),
+    ));
     let providers = {
         let guard = db.connection();
         active_providers(&guard).unwrap_or_default()
@@ -123,11 +129,51 @@ fn select_backend(
                 continue;
             }
             let count = tokens.len();
-            match GeminiBackend::new(base_url.to_string(), tokens) {
+            match GeminiBackend::with_signature_store(
+                base_url.to_string(),
+                tokens,
+                Arc::clone(&signatures),
+            ) {
                 Ok(backend) => {
                     tracing::info!(
                         "backend available: {provider} (gemini, {base_url}, {count} credential(s))"
                     );
+                    backends.insert(provider, Arc::new(backend));
+                }
+                Err(error) => tracing::warn!("backend {provider} skipped: {error}"),
+            }
+            continue;
+        }
+
+        // Responses API protocol (e.g. DeepSeek's `/responses`).
+        if registry
+            .get(&provider)
+            .and_then(|entry| entry.format.as_deref())
+            == Some("openai-responses")
+        {
+            let tokens: Vec<String> = {
+                let guard = db.connection();
+                load_credentials(&guard, &provider, crypto.as_ref())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|credential| credential.token)
+                    .collect()
+            };
+            if tokens.is_empty() && !registry.allows_keyless(&provider) {
+                continue;
+            }
+            let count = tokens.len();
+            match ResponsesBackend::new(provider.clone(), base_url.to_string(), tokens) {
+                Ok(backend) => {
+                    if count == 0 {
+                        tracing::info!(
+                            "backend available: {provider} (responses, {base_url}, keyless)"
+                        );
+                    } else {
+                        tracing::info!(
+                            "backend available: {provider} (responses, {base_url}, {count} credential(s))"
+                        );
+                    }
                     backends.insert(provider, Arc::new(backend));
                 }
                 Err(error) => tracing::warn!("backend {provider} skipped: {error}"),
