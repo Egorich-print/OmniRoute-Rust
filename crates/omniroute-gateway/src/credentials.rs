@@ -88,6 +88,16 @@ pub fn load_credentials(
     Ok(credentials)
 }
 
+/// Distinct providers that have at least one active connection.
+pub fn active_providers(conn: &Connection) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT provider FROM provider_connections WHERE is_active = 1 ORDER BY provider",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 /// Whether a stored `expires_at` is in the past. Unparseable values are
 /// treated as "not expired" so an odd timestamp never hides a credential.
 fn is_expired(expires_at: Option<&str>) -> bool {

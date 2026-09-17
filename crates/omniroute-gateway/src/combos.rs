@@ -120,7 +120,8 @@ pub fn load_combos(conn: &Connection) -> HashMap<String, ComboDef> {
 /// Resolve a combo to ordered `(backend, model)` steps.
 ///
 /// `available` holds the backend names the gateway actually runs. A ref maps
-/// to `grok-cli` for that provider, otherwise to `openai-compatible` when the
+/// to its own provider backend when one is configured, then to `grok-cli`
+/// for that provider, then to a shared `openai-compatible` endpoint when the
 /// registry reports an OpenAI wire format. Anything else is skipped.
 pub fn plan_steps(
     combo: &ComboDef,
@@ -129,15 +130,16 @@ pub fn plan_steps(
 ) -> Vec<(String, String)> {
     let mut steps = Vec::new();
     for entry in &combo.entries {
+        // A backend named after the provider serves it directly.
+        if available.contains(entry.provider.as_str()) {
+            steps.push((entry.provider.clone(), entry.model.clone()));
+            continue;
+        }
         if entry.provider == "grok-cli" && available.contains("grok-cli") {
             steps.push(("grok-cli".to_string(), entry.model.clone()));
             continue;
         }
-        let is_openai = registry
-            .get(entry.provider.as_str())
-            .and_then(|provider| provider.format.as_deref())
-            == Some("openai");
-        if is_openai && available.contains("openai-compatible") {
+        if registry.is_openai_format(&entry.provider) && available.contains("openai-compatible") {
             steps.push(("openai-compatible".to_string(), entry.model.clone()));
         }
     }

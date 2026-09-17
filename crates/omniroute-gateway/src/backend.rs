@@ -63,13 +63,20 @@ pub(crate) fn openai_request_body(request: &ChatCompletionRequest) -> Value {
 pub(crate) fn openai_chunk_to_stream_chunk(value: &Value) -> Option<StreamChunk> {
     let choice = value.get("choices")?.get(0)?;
     let delta = choice.get("delta")?;
+    // Empty-string content is a placeholder some upstreams (OpenRouter free
+    // tiers) stream alongside reasoning; it must not become a delta.
     let content = delta
         .get("content")
         .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
         .map(str::to_string);
+    // OpenRouter uses `reasoning`; OpenAI-compatible proxies use
+    // `reasoning_content`. Accept both.
     let reasoning = delta
         .get("reasoning_content")
+        .or_else(|| delta.get("reasoning"))
         .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
         .map(str::to_string);
     let finish = choice
         .get("finish_reason")
@@ -191,6 +198,20 @@ mod tests {
         .expect("chunk present");
         assert!(chunk.tool_calls.is_some());
         assert!(chunk.content.is_none());
+    }
+
+    #[test]
+    fn chunk_mapping_accepts_openrouter_reasoning() {
+        let chunk = openai_chunk_to_stream_chunk(&json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "", "role": "assistant", "reasoning": "thinking"},
+                "finish_reason": null,
+            }],
+        }))
+        .expect("reasoning chunk present");
+        assert_eq!(chunk.reasoning.as_deref(), Some("thinking"));
+        assert!(chunk.content.is_none(), "empty content must be dropped");
     }
 
     #[test]

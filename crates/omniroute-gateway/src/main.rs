@@ -6,8 +6,13 @@ use omniroute_config::GatewayConfig;
 use omniroute_crypto::{FieldCrypto, load_secret};
 use omniroute_db::Db;
 use omniroute_gateway::{
-    AppState, backend::ChatBackend, backend::EchoBackend, build_router_with_state,
-    credentials::load_credentials, grok_cli::GrokCliBackend, openai::OpenAiBackend,
+    AppState,
+    backend::ChatBackend,
+    backend::EchoBackend,
+    build_router_with_state,
+    credentials::{active_providers, load_credentials},
+    grok_cli::GrokCliBackend,
+    openai::{OpenAiBackend, ProviderOpenAiBackend, resolve_chat_url},
     routing::RoutingBackend,
 };
 use omniroute_providers::ProviderRegistry;
@@ -76,6 +81,41 @@ fn select_backend(
         tracing::info!("backend available: openai-compatible ({base_url})");
     }
 
+    // Per-provider OpenAI-compatible backends from the registry + database.
+    let crypto = load_secret(Some(data_dir)).and_then(|secret| FieldCrypto::from_secret(&secret));
+    let registry = Arc::new(ProviderRegistry::load());
+    let providers = {
+        let guard = db.connection();
+        active_providers(&guard).unwrap_or_default()
+    };
+    for provider in providers {
+        if backends.contains_key(&provider) || !registry.is_openai_format(&provider) {
+            continue;
+        }
+        let Some(base_url) = registry.base_url(&provider) else {
+            continue;
+        };
+        let tokens: Vec<String> = {
+            let guard = db.connection();
+            load_credentials(&guard, &provider, crypto.as_ref())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|credential| credential.token)
+                .collect()
+        };
+        if tokens.is_empty() {
+            continue;
+        }
+        let count = tokens.len();
+        match ProviderOpenAiBackend::new(provider.clone(), resolve_chat_url(base_url), tokens) {
+            Ok(backend) => {
+                tracing::info!("backend available: {provider} ({base_url}, {count} credential(s))");
+                backends.insert(provider, Arc::new(backend));
+            }
+            Err(error) => tracing::warn!("backend {provider} skipped: {error}"),
+        }
+    }
+
     let mut rules = Vec::new();
     if grok_present {
         rules.push(RouteRule {
@@ -126,7 +166,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState::with_db(backend, db).with_require_auth(config.require_auth);
     let app = build_router_with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], config.port));
+    let ip: std::net::IpAddr = config.host.parse()?;
+    let addr = SocketAddr::new(ip, config.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     tracing::info!("omniroute-gateway listening on http://{addr}");

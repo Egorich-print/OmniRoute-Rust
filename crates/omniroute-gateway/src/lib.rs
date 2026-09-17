@@ -191,9 +191,16 @@ fn stream_response(
     let model = request.model.clone();
     let stream = state.backend.stream(request);
 
+    // OpenAI streams announce the assistant role on the first delta; clients
+    // keying off it (LangChain-style) drop deltas without it.
+    let mut role_emitted = false;
     let events = stream.map(move |item| {
         Ok(match item {
-            Ok(chunk) => chunk_event(&id, created, &model, &chunk),
+            Ok(chunk) => {
+                let with_role = !role_emitted;
+                role_emitted = true;
+                chunk_event(&id, created, &model, &chunk, with_role)
+            }
             Err(error) => error_event(&error),
         })
     });
@@ -205,8 +212,17 @@ fn stream_response(
     Sse::new(with_done).keep_alive(KeepAlive::default())
 }
 
-fn chunk_event(id: &str, created: i64, model: &str, chunk: &StreamChunk) -> Event {
+fn chunk_event(
+    id: &str,
+    created: i64,
+    model: &str,
+    chunk: &StreamChunk,
+    announce_role: bool,
+) -> Event {
     let mut delta = serde_json::Map::new();
+    if announce_role {
+        delta.insert("role".into(), json!("assistant"));
+    }
     if let Some(content) = &chunk.content {
         delta.insert("content".into(), json!(content));
     }

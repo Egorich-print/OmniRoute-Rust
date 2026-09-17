@@ -11,6 +11,9 @@ use std::path::PathBuf;
 pub struct GatewayConfig {
     /// TCP port to listen on (`OMNIROUTE_RUST_PORT`, default 20129).
     pub port: u16,
+    /// Interface to bind (`OMNIROUTE_RUST_HOST`, default `127.0.0.1`;
+    /// `0.0.0.0` to match the JS server's all-interfaces default).
+    pub host: String,
     /// Data directory (`DATA_DIR`, else the default resolution).
     pub data_dir: PathBuf,
     /// Log filter (`RUST_LOG` / `OMNIROUTE_LOG`, default `"info"`).
@@ -33,6 +36,11 @@ impl GatewayConfig {
         let get = |key: &str| vars.get(key).map(String::as_str).unwrap_or("");
         Self {
             port: get("OMNIROUTE_RUST_PORT").parse().unwrap_or(20_129),
+            host: if get("OMNIROUTE_RUST_HOST").trim().is_empty() {
+                "127.0.0.1".to_string()
+            } else {
+                get("OMNIROUTE_RUST_HOST").to_string()
+            },
             data_dir: if get("DATA_DIR").trim().is_empty() {
                 omniroute_db::Db::data_dir()
             } else {
@@ -67,6 +75,7 @@ mod tests {
     fn defaults_are_sane() {
         let config = GatewayConfig::from_map(&vars(&[]));
         assert_eq!(config.port, 20_129);
+        assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.log_filter, "info");
         assert!(!config.require_auth);
     }
@@ -81,6 +90,9 @@ mod tests {
         assert_eq!(config.port, 22000);
         assert!(config.require_auth);
         assert_eq!(config.log_filter, "debug");
+
+        let bound = GatewayConfig::from_map(&vars(&[("OMNIROUTE_RUST_HOST", "0.0.0.0")]));
+        assert_eq!(bound.host, "0.0.0.0");
     }
 
     #[test]

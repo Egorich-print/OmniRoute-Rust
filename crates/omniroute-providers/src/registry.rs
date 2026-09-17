@@ -23,6 +23,8 @@ pub struct ProviderEntry {
     pub format: Option<String>,
     pub executor: Option<String>,
     pub auth_type: Option<String>,
+    /// Upstream chat-completions URL, when the provider declares one.
+    pub base_url: Option<String>,
     #[serde(default)]
     pub models: Vec<RegistryModel>,
 }
@@ -115,6 +117,20 @@ impl ProviderRegistry {
     pub fn model_wire_format(&self, provider_id: &str, model_id: &str) -> Option<WireFormat> {
         self.model_target_format(provider_id, model_id)
             .and_then(parse_wire_format)
+    }
+
+    /// Whether a provider speaks the OpenAI wire format.
+    pub fn is_openai_format(&self, provider_id: &str) -> bool {
+        self.get(provider_id)
+            .and_then(|provider| provider.format.as_deref())
+            == Some("openai")
+    }
+
+    /// Upstream chat URL for a provider, if declared.
+    pub fn base_url(&self, provider_id: &str) -> Option<&str> {
+        self.get(provider_id)
+            .and_then(|provider| provider.base_url.as_deref())
+            .filter(|url| !url.is_empty())
     }
 }
 

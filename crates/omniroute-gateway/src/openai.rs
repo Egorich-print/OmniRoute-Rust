@@ -335,3 +335,248 @@ mod tests {
         assert!(error.to_string().contains("bad key"));
     }
 }
+
+/// Resolve a full chat-completions URL from a registry `baseUrl`.
+///
+/// Registry entries vary: some declare the endpoint (`.../chat/completions`),
+/// some only the API root. Append the path only when it is missing.
+pub fn resolve_chat_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
+}
+
+/// Per-provider OpenAI-compatible backend.
+///
+/// Generalises [`OpenAiBackend`] over the registry: the URL comes from the
+/// provider entry, credentials from `provider_connections`, and a pool is
+/// rotated so one exhausted key does not fail the request.
+#[derive(Debug, Clone)]
+pub struct ProviderOpenAiBackend {
+    http: HttpClient,
+    provider: String,
+    chat_url: String,
+    tokens: Vec<String>,
+    next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ProviderOpenAiBackend {
+    /// Build for `provider` against `chat_url` with a credential pool.
+    pub fn new(
+        provider: String,
+        chat_url: String,
+        tokens: Vec<String>,
+    ) -> Result<Self, omniroute_http::client::HttpError> {
+        if tokens.is_empty() {
+            return Err(omniroute_http::client::HttpError::Status {
+                status: 0,
+                body: format!("{provider}: no credentials"),
+            });
+        }
+        Ok(Self {
+            http: HttpClient::new(600)?,
+            provider,
+            chat_url,
+            tokens,
+            next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    /// Pool size.
+    pub fn token_count(&self) -> usize {
+        self.tokens.len()
+    }
+
+    fn next_token(&self) -> &str {
+        let index =
+            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.tokens.len();
+        self.tokens[index].as_str()
+    }
+
+    async fn drive_stream(
+        &self,
+        request: ChatCompletionRequest,
+        tx: mpsc::Sender<Result<StreamChunk, GatewayError>>,
+    ) -> Result<(), GatewayError> {
+        if request.messages.is_empty() {
+            return Err(GatewayError::InvalidRequest("messages is empty".into()));
+        }
+        let mut body = openai_request_body(&request);
+        body["stream"] = Value::from(true);
+        let response = self
+            .http
+            .post_json(&self.chat_url, Some(self.next_token()), &body)
+            .await
+            .map_err(|error| GatewayError::Upstream(error.to_string()))?;
+
+        let mut bytes = response.bytes_stream();
+        let mut decoder = SseDecoder::new();
+        let mut finish_seen = false;
+
+        while let Some(chunk) = bytes.next().await {
+            let chunk = chunk.map_err(|error| GatewayError::Upstream(error.to_string()))?;
+            let text = String::from_utf8_lossy(&chunk);
+            for event in decoder.push(&text) {
+                if event.data.trim() == "[DONE]" {
+                    if !finish_seen {
+                        let _ = tx.send(Ok(StreamChunk::done("stop"))).await;
+                    }
+                    return Ok(());
+                }
+                let data: Value = match serde_json::from_str(&event.data) {
+                    Ok(data) => data,
+                    Err(_) => continue,
+                };
+                if let Some(error) = data.get("error") {
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("upstream error");
+                    return Err(GatewayError::Upstream(message.to_string()));
+                }
+                if let Some(stream_chunk) = openai_chunk_to_stream_chunk(&data) {
+                    if stream_chunk.finish_reason.is_some() {
+                        finish_seen = true;
+                    }
+                    if tx.send(Ok(stream_chunk)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if !finish_seen {
+            let _ = tx.send(Ok(StreamChunk::done("stop"))).await;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ChatBackend for ProviderOpenAiBackend {
+    fn name(&self) -> &'static str {
+        // Static str required by the trait; the pool/URL carry the provider.
+        "provider"
+    }
+
+    async fn complete(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse, GatewayError> {
+        if request.messages.is_empty() {
+            return Err(GatewayError::InvalidRequest("messages is empty".into()));
+        }
+        let mut body = openai_request_body(&request);
+        body["stream"] = Value::from(false);
+
+        let mut last_error: Option<GatewayError> = None;
+        for _ in 0..self.tokens.len() {
+            let response = match self
+                .http
+                .post_json(&self.chat_url, Some(self.next_token()), &body)
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = Some(GatewayError::Upstream(error.to_string()));
+                    continue;
+                }
+            };
+            let payload: Value = match response.json().await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    last_error = Some(GatewayError::Upstream(error.to_string()));
+                    continue;
+                }
+            };
+            if let Some(message) = payload
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+            {
+                last_error = Some(GatewayError::Upstream(message.to_string()));
+                continue;
+            }
+            return Ok(openai_payload_to_completion(&request.model, &payload));
+        }
+        Err(last_error.unwrap_or_else(|| {
+            GatewayError::Upstream(format!("{}: all credentials failed", self.provider))
+        }))
+    }
+
+    fn stream(&self, request: ChatCompletionRequest) -> ChunkStream {
+        let (tx, rx) = mpsc::channel(64);
+        let backend = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = backend.drive_stream(request, tx.clone()).await {
+                let _ = tx.send(Err(error)).await;
+            }
+        });
+        Box::pin(ReceiverStream::new(rx))
+    }
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::*;
+    use omniroute_core::{ChatCompletionRequest, ChatMessage};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    #[test]
+    fn chat_url_resolution_handles_both_shapes() {
+        assert_eq!(
+            resolve_chat_url("https://openrouter.ai/api/v1"),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+        assert_eq!(
+            resolve_chat_url("https://openrouter.ai/api/v1/chat/completions"),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_backend_serves_completion() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-1",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hi"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = ProviderOpenAiBackend::new(
+            "openrouter".to_string(),
+            resolve_chat_url(&format!("{}/v1", server.uri())),
+            vec!["k".to_string()],
+        )
+        .unwrap();
+
+        let response = backend
+            .complete(ChatCompletionRequest {
+                model: "some/model:free".to_string(),
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "hi".to_string(),
+                }],
+                stream: false,
+                max_tokens: None,
+                temperature: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.choices[0].message.content, "hi");
+    }
+}
