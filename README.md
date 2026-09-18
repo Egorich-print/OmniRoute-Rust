@@ -1,5 +1,13 @@
 <div align="center">
 
+> **ARCHIVED 2026-09-19 — this project continues as
+> [Heterion Router](https://github.com/Egorich-print/heterion-router)**
+> (Rust gateway + dashboard + Tauri desktop; sibling of Heterion).
+> This repository is a frozen reference: the JS app plus the pre-rename
+> Rust port (`feat/rust-gateway-tauri-shell`). See
+> [`docs/adr/`](https://github.com/Egorich-print/heterion-router/tree/main/docs/adr)
+> (ADR-008) for the rename record.
+
 <img src="./docs/screenshots/MainOmniRoute.png" alt="OmniRoute Dashboard" width="820"/>
 
 <br/>
